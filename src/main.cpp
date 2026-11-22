@@ -109,8 +109,8 @@ static const u8 DIM[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 // Per-thread cache: raw "YYYY-MM-DD" digits -> days since epoch (or BAD_DAYS).
 static const i32 BAD_DAYS = INT32_MIN;
 struct DateCache {
-  u64 key[64];
-  i32 days[64];
+  u64 key[1024];
+  i32 days[1024];
 };
 static thread_local DateCache t_dc;
 
@@ -150,7 +150,7 @@ static inline bool parse_civil(const u8* p, i64& secs) {
   u64 a = load8(p), b = load8(p + 8);
   const u64 ma = 0x00FFFF00FFFFFFFFULL;
   u64 key = (a & ma) | ((b & 0xFF) << 32) | ((b & 0xFF00) << 48);
-  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 58);
+  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 54);
   i32 days;
   if (LIKELY(t_dc.key[h] == key)) {
     days = t_dc.days[h];
@@ -175,7 +175,7 @@ static inline bool parse_civil(const u8* p, i64& secs) {
   err |= ((a & ~ma) ^ 0x2D00002D00000000ULL) | ((b & ~mb) ^ 0x00003A0000540000ULL) | ((c & 0xFF) ^ ':');
   if (UNLIKELY(err)) return false;
   u64 key = (a & ma) | ((b & 0xFF) << 32) | ((b & 0xFF00) << 48);
-  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 58);
+  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 54);
   i32 days;
   if (LIKELY(t_dc.key[h] == key)) {
     days = t_dc.days[h];
@@ -204,7 +204,7 @@ static inline bool parse_ingest(const u8* p, u32 n, i64& out) {
   u64 a = load8(p), b = load8(p + 8), c = load8(p + 16);
   const u64 ma = 0x00FFFF00FFFFFFFFULL;
   u64 key = (a & ma) | ((b & 0xFF) << 32) | ((b & 0xFF00) << 48);
-  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 58);
+  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 54);
   i32 days;
   if (LIKELY(t_dc.key[h] == key)) {
     days = t_dc.days[h];
