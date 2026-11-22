@@ -43,6 +43,11 @@ static void die(const char* msg) {
   _exit(1);
 }
 
+// Bucket choice: top bits of hb(x). Table slots: top bits of ht(x). One multiply each.
+static inline u64 hb(u64 x) { return x * 0x9E3779B97F4A7C15ULL; }
+static inline u64 ht(u64 x) { return (x ^ (x >> 29)) * 0xC2B2AE3D27D4EB4FULL; }
+static inline u64 slot_of(u64 x, u32 shift) { return ht(x) >> shift; }
+static inline u32 shift_of(u64 cap) { return 64 - (u32)__builtin_ctzll(cap); }
 static inline u64 mix64(u64 x) {
   x ^= x >> 31;
   x *= 0x7fb5d329728ea185ULL;
@@ -119,6 +124,46 @@ static i32 days_of_key(const u8* p) {
   return (i32)fast_days(year, mon, day);
 }
 
+#if defined(__SSE4_1__)
+#include <immintrin.h>
+// SSE version: validates all 19 bytes with two 16-byte compares and computes
+// seconds-of-day with pshufb + pmaddubsw + pmaddwd. The date goes through the cache.
+static inline bool parse_civil(const u8* p, i64& secs) {
+  const __m128i x = _mm_loadu_si128((const __m128i*)(p + 3));  // Y-MM-DDTHH:MM:SS
+  const __m128i y = _mm_loadu_si128((const __m128i*)p);        // YYYY-...
+  const __m128i lo = _mm_set1_epi8('0' - 1), hi = _mm_set1_epi8('9' + 1);
+  u32 dx = (u32)_mm_movemask_epi8(_mm_and_si128(_mm_cmpgt_epi8(x, lo), _mm_cmplt_epi8(x, hi)));
+  u32 dy = (u32)_mm_movemask_epi8(_mm_and_si128(_mm_cmpgt_epi8(y, lo), _mm_cmplt_epi8(y, hi)));
+  const __m128i tmpl = _mm_setr_epi8(0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0);
+  u32 sx = (u32)_mm_movemask_epi8(_mm_cmpeq_epi8(x, tmpl));
+  // digits at x lanes 0,2,3,5,6,8,9,11,12,14,15; separators at 1,4,7,10,13; y lanes 0..2 digits
+  const u32 DIG = 0xDB6D, SEP = 0x2492;
+  if (UNLIKELY(((dx & DIG) != DIG) | ((sx & SEP) != SEP) | ((dy & 7) != 7))) return false;
+  // HH MM SS DD pairs -> 16-bit values
+  const __m128i shuf = _mm_setr_epi8(8, 9, 11, 12, 14, 15, 5, 6, -1, -1, -1, -1, -1, -1, -1, -1);
+  __m128i d = _mm_sub_epi8(_mm_shuffle_epi8(x, shuf), _mm_setr_epi8('0', '0', '0', '0', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, 0, 0));
+  __m128i v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+  u32 over = (u32)_mm_movemask_epi8(_mm_cmpgt_epi16(v, _mm_setr_epi16(23, 59, 59, 32767, 32767, 32767, 32767, 32767)));
+  if (UNLIKELY(over)) return false;
+  __m128i t = _mm_madd_epi16(v, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+  u32 sod = (u32)_mm_cvtsi128_si32(t) + (u32)_mm_extract_epi32(t, 1);
+  u64 a = load8(p), b = load8(p + 8);
+  const u64 ma = 0x00FFFF00FFFFFFFFULL;
+  u64 key = (a & ma) | ((b & 0xFF) << 32) | ((b & 0xFF00) << 48);
+  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 58);
+  i32 days;
+  if (LIKELY(t_dc.key[h] == key)) {
+    days = t_dc.days[h];
+  } else {
+    days = days_of_key(p);
+    t_dc.key[h] = key;
+    t_dc.days[h] = days;
+  }
+  if (UNLIKELY(days == BAD_DAYS)) return false;
+  secs = (i64)days * 86400 + sod;
+  return true;
+}
+#else
 // Calendar part "YYYY-MM-DDTHH:MM:SS" (19 bytes) -> seconds. Reads 24 bytes.
 static inline bool parse_civil(const u8* p, i64& secs) {
   u64 a = load8(p), b = load8(p + 8), c = load8(p + 16);
@@ -147,6 +192,7 @@ static inline bool parse_civil(const u8* p, i64& secs) {
   secs = (i64)days * 86400 + hh * 3600 + mm * 60 + ss;
   return true;
 }
+#endif
 
 // Parses F1 / F2 / F3 into epoch milliseconds. False for any bad form.
 // May read up to 24 bytes from p (the input is padded).
@@ -1150,6 +1196,7 @@ static LSlot* g_lt = nullptr;
 static std::atomic<u32>* g_lparent = nullptr;  // 0 = root, else parent slot + 1
 static std::atomic<u64>* g_lbest = nullptr;
 static u64 g_lmask = 0;
+static u32 g_lshift = 64;
 static bool g_lempty = true;
 
 static void links_alloc(size_t npairs, Arena& a) {
@@ -1160,11 +1207,12 @@ static void links_alloc(size_t npairs, Arena& a) {
   g_lparent = (std::atomic<u32>*)a.alloc(cap * sizeof(u32));
   g_lbest = (std::atomic<u64>*)a.alloc(cap * sizeof(u64));
   g_lmask = cap - 1;
+  g_lshift = shift_of(cap);
   g_lempty = npairs == 0;
 }
 
 static inline u32 lt_insert(u64 k) {
-  u64 h = mix64(k) & g_lmask;
+  u64 h = slot_of(k, g_lshift);
   for (;;) {
     u64 cur = g_lt[h].key.load(std::memory_order_relaxed);
     if (cur == k) return (u32)h;
@@ -1221,12 +1269,12 @@ static void links_finish(size_t lo, size_t hi) {
 }
 
 static inline void person_prefetch(u64 user) {
-  if (!g_lempty) __builtin_prefetch(&g_lt[mix64(user) & g_lmask]);
+  if (!g_lempty) __builtin_prefetch(&g_lt[slot_of(user, g_lshift)]);
 }
 
 static inline u64 person_of(u64 user) {
   if (g_lempty) return user;
-  u64 h = mix64(user) & g_lmask;
+  u64 h = slot_of(user, g_lshift);
   for (;;) {
     u64 k = g_lt[h].key.load(std::memory_order_relaxed);
     if (k == user) return g_lt[h].pv;
@@ -1305,7 +1353,7 @@ static void parse_events(const Chunk& c0, ThreadState& t) {
     g_sink += r.ev + r.ts + r.user + r.ingest;
     return;
 #endif
-    t.eb.push(mix64(r.ev) >> eshift, r);
+    t.eb.push(hb(r.ev) >> eshift, r);
   });
 }
 
@@ -1349,7 +1397,7 @@ static void route_clicks(ThreadState& t) {
     o.ts = c.ts;
     o.camp = c.camp;
     o.pad = 0;
-    t.cb.push(mix64(o.person) >> pshift, o);
+    t.cb.push(hb(o.person) >> pshift, o);
   }
 }
 
@@ -1403,64 +1451,75 @@ struct U64Map {  // open addressing, interleaved key/value, key 0 = empty
 };
 
 // ---------------------------------------------------------------- phase 3: dedup
-struct DSlot {
+struct DSlot {  // unused; kept for the worker's scratch type
   u64 key;
   const ERec* r;
 };
-static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>& tab, std::vector<const ERec*>& tv) {
+// Dedup one event bucket: records live in a reused open-addressing table of
+// whole ERecs (L2-resident), with an occupancy bitmap instead of a memset.
+static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>&, std::vector<const ERec*>&) {
+  static thread_local std::vector<ERec> tab;
+  static thread_local std::vector<u64> occ;
+  static thread_local std::vector<u64> users;
+  static thread_local std::vector<u32> keep;
   size_t n = 0;
   for (int i = 0; i < g_nt; i++) n += g_ts[i].eb.count(b);
   if (!n) return;
-  size_t cap = 16;
+  size_t cap = 64;
   while (cap < n + n / 2) cap <<= 1;
   if (tab.size() < cap) tab.resize(cap);
-  DSlot* T = tab.data();
-  memset((void*)T, 0, cap * sizeof(DSlot));
-  u64 mask = cap - 1;
+  if (occ.size() < cap / 64) occ.resize(cap / 64);
+  ERec* T = tab.data();
+  u64* O = occ.data();
+  memset(O, 0, cap / 8);
+  const u64 mask = cap - 1;
+  const u32 tsh = shift_of(cap);
   for (int i = 0; i < g_nt; i++) {
     g_ts[i].eb.each(b, [&](const ERec& r) {
-      u64 h = mix64(r.ev) & mask;
+      u64 h = slot_of(r.ev, tsh);
       for (;;) {
-        u64 k = T[h].key;
-        if (k == 0) {
-          T[h].key = r.ev;
-          T[h].r = &r;
+        u64 bit = 1ULL << (h & 63);
+        if (!(O[h >> 6] & bit)) {
+          O[h >> 6] |= bit;
+          T[h] = r;
           break;
         }
-        if (k == r.ev) {
-          if (r.ingest < T[h].r->ingest) T[h].r = &r;
+        if (T[h].ev == r.ev) {
+          if (r.ingest < T[h].ingest) T[h] = r;
           break;
         }
         h = (h + 1) & mask;
       }
     });
   }
-  const u32 pshift = 64 - g_pbits;
-  // Compact the survivors, then resolve persons with prefetching.
-  if (tv.size() < n) tv.resize(n);
-  size_t m = 0;
-  for (size_t h = 0; h < cap; h++) {
-    if (!T[h].key) continue;
-    const ERec* r = T[h].r;
-    if (r->ts != BAD_TS) tv[m++] = r;
+  // Survivors: occupied slots whose kept copy is valid.
+  if (keep.size() < n) keep.resize(n);
+  u32 m = 0;
+  for (size_t w = 0; w < cap / 64; w++) {
+    u64 bits = O[w];
+    while (bits) {
+      u32 h = (u32)(w * 64 + __builtin_ctzll(bits));
+      bits &= bits - 1;
+      keep[m] = h;
+      m += T[h].ts != BAD_TS;
+    }
   }
-  // Pass 1: person lookups only (prefetched); pass 2: scatter. Keeping the
-  // streaming stores out of the lookup loop leaves fill buffers for the misses.
-  static thread_local std::vector<u64> pers;
-  if (pers.size() < m) pers.resize(m);
+  // Person lookups only (prefetched), then the scatter by person.
+  if (users.size() < m) users.resize(m);
   const size_t D = SS_PFD;
-  for (size_t i = 0; i < m && i < D; i++) person_prefetch(tv[i]->user);
-  for (size_t i = 0; i < m; i++) {
-    if (i + D < m) person_prefetch(tv[i + D]->user);
-    pers[i] = person_of(tv[i]->user);
+  for (u32 i = 0; i < m && i < D; i++) person_prefetch(T[keep[i]].user);
+  for (u32 i = 0; i < m; i++) {
+    if (i + D < m) person_prefetch(T[keep[i + D]].user);
+    users[i] = person_of(T[keep[i]].user);
   }
-  for (size_t i = 0; i < m; i++) {
-    const ERec* r = tv[i];
+  const u32 pshift = 64 - g_pbits;
+  for (u32 i = 0; i < m; i++) {
+    const ERec& r = T[keep[i]];
     PRec o;
-    o.person = pers[i];
-    o.ts = r->ts;
-    o.pc = r->price;
-    t.pb.push(mix64(o.person) >> pshift, o);
+    o.person = users[i];
+    o.ts = r.ts;
+    o.pc = r.price;
+    t.pb.push(hb(o.person) >> pshift, o);
   }
 }
 
@@ -1652,6 +1711,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
   if (s.slot.size() < cap) s.slot.resize(cap);
   std::fill(s.slot.begin(), s.slot.begin() + cap, 0);
   u64 mask = cap - 1;
+  const u32 tsh = shift_of(cap);
   s.ents.clear();
   if (s.t1.size() < n) {
     s.t1.resize(n);
@@ -1662,7 +1722,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
   size_t k = 0;
   for (int i = 0; i < g_nt; i++)
     g_ts[i].pb.each(b, [&](const PRec& r) {
-      u64 h = mix64(r.person) & mask;
+      u64 h = slot_of(r.person, tsh);
       u32 e;
       for (;;) {
         e = s.slot[h];
@@ -1709,7 +1769,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
 #endif
   PT(1);
   auto lookup = [&](u64 p) -> u32 {
-    u64 h = mix64(p) & mask;
+    u64 h = slot_of(p, tsh);
     for (;;) {
       u32 e = s.slot[h];
       if (!e) return 0;
@@ -2215,8 +2275,11 @@ int main(int argc, char** argv) {
   size_t est_events = ebytes / 70 + 1024;
   g_ebits = 6;
   while ((est_events >> g_ebits) > 16384 && g_ebits < 14) g_ebits++;
+  if (getenv("SS_EBITS")) g_ebits = atoi(getenv("SS_EBITS"));
   g_pbits = g_ebits;
+  if (getenv("SS_PBITS")) g_pbits = atoi(getenv("SS_PBITS"));
   size_t nb = (size_t)1 << g_ebits;
+  size_t npb = (size_t)1 << g_pbits;
 
   g_ts.resize(g_nt);
   std::atomic<size_t> next{0}, nextb{0}, nextp{0};
@@ -2229,8 +2292,8 @@ int main(int argc, char** argv) {
     th.emplace_back([&, t]() {
       ThreadState& me = g_ts[t];
       me.eb.init(nb, &me.arena);
-      me.pb.init(nb, &me.arena);
-      me.cb.init(nb, &me.arena);
+      me.pb.init(npb, &me.arena);
+      me.cb.init(npb, &me.arena);
       me.camp.assign((size_t)(g_ncamp + 1) * g_ndays * 4, 0);
       me.clicks.reserve(cbytes / 40 / g_nt * 5 / 4 + 1024);
       // Links first, all threads: parse, union-find, smallest ID per person.
@@ -2288,7 +2351,7 @@ int main(int argc, char** argv) {
         s.since.assign(g_ncamp + 1, 0);
         for (;;) {
           size_t b = nextp.fetch_add(1);
-          if (b >= nb) break;
+          if (b >= npb) break;
           person_bucket((int)b, me, s);
         }
       }
