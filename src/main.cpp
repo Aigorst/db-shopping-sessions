@@ -282,6 +282,109 @@ static void init_b36() {
   for (int i = 0; i < 26; i++) B36T['a' + i] = (u8)(10 + i);
 }
 
+// Long ids of the v5 shape: one prefix byte + 32 lowercase hex digits. A
+// lock-free table maps (prefix, 128-bit value) to a stable slot; the code is
+// INTERN_BIT | HEX_BIT | slot, and the text is rebuilt from the slot.
+static const u64 HEX_BIT = 1ULL << 62;
+struct HSlot {
+  std::atomic<u64> state;  // 0 empty, 1 being written, 0x100 | prefix when ready
+  u64 hi, lo;
+};
+// Table 0: user ids (events, clicks, links). Table 1: click ids. Long event ids
+// need no table: they dedup on their full 128-bit value (see LRec).
+static const u64 TAB_BIT = 1ULL << 61;
+struct HexTab {
+  HSlot* s = nullptr;
+  u64 mask = 0;
+  std::atomic<u64> count{0};
+  u64 limit = 0;
+};
+static HexTab g_ht[2];
+static void hex_alloc(int k, size_t want) {
+  HexTab& T = g_ht[k];
+  size_t cap = 1 << 12;
+  while (cap < want) cap <<= 1;
+  T.s = (HSlot*)mmap(nullptr, cap * sizeof(HSlot), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                     -1, 0);
+  if ((void*)T.s == MAP_FAILED) {
+    T.s = nullptr;
+    return;
+  }
+  T.mask = cap - 1;
+  T.limit = cap / 4 * 3;
+}
+static inline bool hex32(const u8* p, u64& hi, u64& lo) {
+#if defined(__SSSE3__)
+  const __m128i a = _mm_loadu_si128((const __m128i*)p), b = _mm_loadu_si128((const __m128i*)(p + 16));
+  const __m128i c0 = _mm_set1_epi8('0' - 1), c9 = _mm_set1_epi8('9' + 1), ca = _mm_set1_epi8('a' - 1),
+                cf = _mm_set1_epi8('f' + 1);
+  __m128i da = _mm_and_si128(_mm_cmpgt_epi8(a, c0), _mm_cmplt_epi8(a, c9));
+  __m128i db = _mm_and_si128(_mm_cmpgt_epi8(b, c0), _mm_cmplt_epi8(b, c9));
+  __m128i la = _mm_and_si128(_mm_cmpgt_epi8(a, ca), _mm_cmplt_epi8(a, cf));
+  __m128i lb = _mm_and_si128(_mm_cmpgt_epi8(b, ca), _mm_cmplt_epi8(b, cf));
+  if (_mm_movemask_epi8(_mm_and_si128(_mm_or_si128(da, la), _mm_or_si128(db, lb))) != 0xFFFF) return false;
+  // nibble = c - '0' - (letter ? 39 : 0)
+  __m128i na = _mm_sub_epi8(_mm_sub_epi8(a, _mm_set1_epi8('0')), _mm_and_si128(la, _mm_set1_epi8(39)));
+  __m128i nb = _mm_sub_epi8(_mm_sub_epi8(b, _mm_set1_epi8('0')), _mm_and_si128(lb, _mm_set1_epi8(39)));
+  const __m128i w = _mm_set1_epi16(0x0110);  // bytes (16, 1): first char is the high nibble
+  __m128i pa = _mm_maddubs_epi16(na, w), pb = _mm_maddubs_epi16(nb, w);
+  __m128i packed = _mm_packus_epi16(pa, pb);
+  hi = (u64)_mm_cvtsi128_si64(packed);
+  lo = (u64)_mm_cvtsi128_si64(_mm_unpackhi_epi64(packed, packed));
+  return true;
+#else
+  u8 out[16];
+  for (int i = 0; i < 16; i++) {
+    int v[2];
+    for (int j = 0; j < 2; j++) {
+      u8 c = p[2 * i + j];
+      if (c >= '0' && c <= '9')
+        v[j] = c - '0';
+      else if (c >= 'a' && c <= 'f')
+        v[j] = c - 'a' + 10;
+      else
+        return false;
+    }
+    out[i] = (u8)(v[0] * 16 + v[1]);
+  }
+  memcpy(&hi, out, 8);
+  memcpy(&lo, out + 8, 8);
+  return true;
+#endif
+}
+static u64 intern_slow(const u8* p, u32 n);
+static u64 hex_code(int k, const u8* p, u64 hi, u64 lo) {
+  HexTab& T = g_ht[k];
+  const u64 ready = 0x100 | p[0];
+  const u64 tag = INTERN_BIT | HEX_BIT | ((u64)k * TAB_BIT);
+  u64 h = ((hi * 0x9E3779B97F4A7C15ULL) ^ (lo * 0xC2B2AE3D27D4EB4FULL) ^ (ready << 7));
+  h = (h ^ (h >> 29)) & T.mask;
+  for (;;) {
+    HSlot& sl = T.s[h];
+    u64 st = sl.state.load(std::memory_order_acquire);
+    if (st == 0) {
+      if (T.count.load(std::memory_order_relaxed) >= T.limit) return intern_slow(p, 33);  // table full
+      u64 z = 0;
+      if (sl.state.compare_exchange_strong(z, 1, std::memory_order_acquire)) {
+        sl.hi = hi;
+        sl.lo = lo;
+        sl.state.store(ready, std::memory_order_release);
+        T.count.fetch_add(1, std::memory_order_relaxed);
+        return tag | h;
+      }
+      continue;  // lost the race: re-read this slot
+    }
+    while (st == 1) st = sl.state.load(std::memory_order_acquire);
+    if (st == ready && sl.hi == hi && sl.lo == lo) return tag | h;
+    h = (h + 1) & T.mask;
+  }
+}
+static inline u64 long_code(const u8* p, u32 n, int k) {
+  u64 hi, lo;
+  if (n == 33 && g_ht[k].s && hex32(p + 1, hi, lo)) return hex_code(k, p, hi, lo);
+  return intern_slow(p, n);
+}
+
 static u64 intern_slow(const u8* p, u32 n) {
   std::string s((const char*)p, n);
   std::lock_guard<std::mutex> g(g_intern_mu);
@@ -296,7 +399,7 @@ static u64 intern_slow(const u8* p, u32 n) {
 #if defined(__BMI2__) && defined(__SSE2__)
 #include <immintrin.h>
 // Compact code: b0 << 52 | len << 48 | digits (6 bits each, first char highest).
-__attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n) {
+__attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n, int k = 0) {
   if (LIKELY(n - 1 < 9)) {
     const __m128i iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     __m128i lanes = _mm_cmplt_epi8(iota, _mm_set1_epi8((char)(n - 1)));
@@ -311,13 +414,13 @@ __attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n) {
       return ((u64)p[0] << 52) | ((u64)n << 48) | _pext_u64(x, 0x3F3F3F3F3F3F3F3FULL);
     }
   }
-  return intern_slow(p, n);
+  return long_code(p, n, k);
 }
 #define SS_CODE_OF_DEFINED
 #endif
 // Compact code: b0 << 52 | len << 48 | digits (6 bits each, first char highest).
 #ifndef SS_CODE_OF_DEFINED
-__attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n) {
+__attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n, int k = 0) {
   if (LIKELY(n - 1 < 9)) {
     u64 v = 0;
     u8 bad = 0;
@@ -341,14 +444,27 @@ __attribute__((always_inline)) static inline u64 code_of(const u8* p, u32 n) {
     }
     if (LIKELY(!(bad & 0x80))) return ((u64)p[0] << 52) | ((u64)n << 48) | v;
   }
-  return intern_slow(p, n);
+  return long_code(p, n, k);
 }
 #endif
 
 // Decodes into buf (>= 16 bytes for compact); returns pointer and length.
 static inline const char* decode(u64 c, char* buf, u32& len) {
+  if ((c & (INTERN_BIT | HEX_BIT)) == (INTERN_BIT | HEX_BIT)) {
+    const HSlot& sl = g_ht[(c & TAB_BIT) ? 1 : 0].s[c & (TAB_BIT - 1)];
+    buf[0] = (char)(sl.state.load(std::memory_order_relaxed) & 0xff);
+    u8 bytes[16];
+    memcpy(bytes, &sl.hi, 8);
+    memcpy(bytes + 8, &sl.lo, 8);
+    for (int i = 0; i < 16; i++) {
+      buf[1 + 2 * i] = "0123456789abcdef"[bytes[i] >> 4];
+      buf[2 + 2 * i] = "0123456789abcdef"[bytes[i] & 15];
+    }
+    len = 33;
+    return buf;
+  }
   if (c & INTERN_BIT) {
-    const std::string& s = (*g_intern_strs)[(u32)(c & 0xffffffffu)];
+    const std::string& s = (*g_intern_strs)[(u32)(c & 0xffffffffu)];  // HEX_BIT clear here
     len = (u32)s.size();
     return s.data();
   }
@@ -362,7 +478,7 @@ static inline const char* decode(u64 c, char* buf, u32& len) {
 static int code_cmp(u64 a, u64 b) {
   if (a == b) return 0;
   if (!((a | b) & INTERN_BIT) && (a >> 48) == (b >> 48)) return a < b ? -1 : 1;
-  char ba[16], bb[16];
+  char ba[40], bb[40];
   u32 la, lb;
   const char* sa = decode(a, ba, la);
   const char* sb = decode(b, bb, lb);
@@ -1042,6 +1158,14 @@ struct ERec {  // parsed event copy, grouped by event_id
   u32 price;   // purchase price, 0 for view/cart
   u32 cat;
 };
+struct LRec {  // event copy with a long (prefix + 32 hex) id, grouped by hash of the id
+  u64 hi, lo;
+  u64 user;
+  u32 ingest, ts;
+  u32 price;  // price | cat << 24
+  u32 prefix;
+  u64 pad[3];
+};
 struct CRec {  // valid click, grouped later by person
   u64 user;
   u64 click;
@@ -1215,8 +1339,10 @@ static int g_nt;
 static int g_ebits, g_pbits;
 
 struct ThreadState {
+  int tid = 0;
   Arena arena;
   Buckets<ERec, 8192> eb;   // by hash(event_id)
+  Buckets<LRec, 8192> lb;   // long event ids, by hash of the 128-bit value
   std::vector<CRec> clicks;
   Buckets<PRec, 8192> pb;   // by hash(person)
   Buckets<PClick, 8192> cb;  // by hash(person)
@@ -1352,6 +1478,10 @@ static inline bool parse_price(const Field& pr, u32& out) {
 #ifndef SS_STAGE
 #define SS_STAGE 0
 #endif
+static bool g_fast = false;
+static u32 g_psh = 13;
+static inline bool event_index(const u8* p, u32 n, u64& idx);
+static void odd_push(int tid, const ERec& r);
 static thread_local u64 g_sink;
 static void parse_events(const Chunk& c0, ThreadState& t) {
   Chunk c = c0;
@@ -1369,7 +1499,10 @@ static void parse_events(const Chunk& c0, ThreadState& t) {
 #endif
     if (UNLIKELY(f[0].n == 0)) return;
     ERec r;
-    r.ev = code_of(f[0].p, f[0].n);
+    u64 idx = 0, lhi = 0, llo = 0;
+    bool fast_id = g_fast && event_index(f[0].p, f[0].n, idx);
+    bool long_id = !g_fast && f[0].n == 33 && hex32(f[0].p + 1, lhi, llo);
+    r.ev = fast_id ? idx : (long_id ? 0 : code_of(f[0].p, f[0].n));
     i64 ing;
     if (UNLIKELY(!parse_ingest(f[3].p, f[3].n, ing))) ing = INT64_MAX / 2;
     i64 is = ing / 1000 - g_ingest_base_s;
@@ -1401,6 +1534,26 @@ static void parse_events(const Chunk& c0, ThreadState& t) {
     g_sink += r.ev + r.ts + r.user + r.ingest;
     return;
 #endif
+    if (g_fast) {
+      if (LIKELY(fast_id))
+        t.eb.push(r.ev >> g_psh, r);
+      else
+        odd_push(t.tid, r);
+      return;
+    }
+    if (UNLIKELY(long_id)) {
+      LRec l;
+      l.hi = lhi;
+      l.lo = llo;
+      l.user = r.user;
+      l.ingest = r.ingest;
+      l.ts = r.ts;
+      l.price = r.price;
+      l.prefix = f[0].p[0];
+      l.pad[0] = l.pad[1] = l.pad[2] = 0;
+      t.lb.push(hb(lhi ^ (llo * 0xC2B2AE3D27D4EB4FULL)) >> eshift, l);
+      return;
+    }
     t.eb.push(hb(r.ev) >> eshift, r);
   });
 }
@@ -1420,7 +1573,7 @@ static void parse_clicks(const Chunk& c0, ThreadState& t) {
     if (camp == 0xFFFFFFFFu) return;
     CRec r;
     r.user = code_of(f[1].p, f[1].n);
-    r.click = code_of(f[0].p, f[0].n);
+    r.click = code_of(f[0].p, f[0].n, 1);
     r.ts = (u32)(ts - cs);
     r.camp = camp;
     t.clicks.push_back(r);
@@ -1503,73 +1656,161 @@ struct DSlot {  // unused; kept for the worker's scratch type
   u64 key;
   const ERec* r;
 };
-// Dedup one event bucket: records live in a reused open-addressing table of
-// whole ERecs (L2-resident), with an occupancy bitmap instead of a memset.
+// Dedup one event bucket. A 2-bit saturating counter per hash slot (L1/L2
+// resident) marks event ids seen once; those are unique and skip any table.
+// Ids whose counter reached 2 (true duplicates or hash collisions) are
+// resolved exactly in a small open-addressing table keyed by the full id.
+struct Surv {
+  u64 user;
+  u32 ts;
+  u32 pc;
+};
 static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>&, std::vector<const ERec*>&) {
-  static thread_local std::vector<ERec> tab;
-  static thread_local std::vector<u64> occ;
+  static thread_local std::vector<u64> bm;
+  static thread_local std::vector<const ERec*> ctab;
+  static thread_local std::vector<Surv> sv;
   static thread_local std::vector<u64> users;
-  static thread_local std::vector<u32> keep;
-  size_t n = 0;
-  for (int i = 0; i < g_nt; i++) n += g_ts[i].eb.count(b);
-  if (!n) return;
-  size_t cap = 64;
-  while (cap < n + n / 2) cap <<= 1;
-  if (tab.size() < cap) tab.resize(cap);
-  if (occ.size() < cap / 64) occ.resize(cap / 64);
-  ERec* T = tab.data();
-  u64* O = occ.data();
-  memset(O, 0, cap / 8);
-  const u64 mask = cap - 1;
-  const u32 tsh = shift_of(cap);
+  size_t n = 0, ln = 0;
   for (int i = 0; i < g_nt; i++) {
+    n += g_ts[i].eb.count(b);
+    ln += g_ts[i].lb.count(b);
+  }
+  if (!n && !ln) return;
+  size_t slots = 256;
+  while (slots < n * 4) slots <<= 1;  // 2 bits each: n bytes
+  if (bm.size() < slots / 32) bm.resize(slots / 32);
+  u64* B = bm.data();
+  memset(B, 0, slots / 4);
+  const u32 bsh = shift_of(slots);
+  for (int i = 0; i < g_nt; i++)
     g_ts[i].eb.each(b, [&](const ERec& r) {
-      u64 h = slot_of(r.ev, tsh);
+      u64 h = slot_of(r.ev, bsh);
+      u64& w = B[h >> 5];
+      u32 sh = (u32)(h & 31) * 2;
+      u64 c = (w >> sh) & 3;
+      w += (u64)(c < 2) << sh;
+    });
+  if (sv.size() < n + ln) sv.resize(n + ln);
+  Surv* S = sv.data();
+  size_t m = 0, nc = 0;
+  // Candidate table sized lazily; most buckets have ~3% candidates.
+  size_t ccap = 64;
+  while (ccap < (n / 8) * 2 + 64) ccap <<= 1;
+  if (ctab.size() < ccap) ctab.resize(ccap);
+  const ERec** C = ctab.data();
+  memset((void*)C, 0, ccap * sizeof(const ERec*));
+  u64 cmask = ccap - 1;
+  u32 csh = shift_of(ccap);
+  bool overflow = false;
+  for (int i = 0; i < g_nt; i++)
+    g_ts[i].eb.each(b, [&](const ERec& r) {
+      u64 h = slot_of(r.ev, bsh);
+      u64 c = (B[h >> 5] >> ((h & 31) * 2)) & 3;
+      if (LIKELY(c == 1)) {
+        if (r.ts != BAD_TS) S[m++] = {r.user, r.ts, r.price};
+        return;
+      }
+      if (UNLIKELY(nc * 2 >= ccap)) {
+        overflow = true;
+        return;
+      }
+      u64 j = slot_of(r.ev, csh);
       for (;;) {
-        u64 bit = 1ULL << (h & 63);
-        if (!(O[h >> 6] & bit)) {
-          O[h >> 6] |= bit;
-          T[h] = r;
+        const ERec* x = C[j];
+        if (!x) {
+          C[j] = &r;
+          nc++;
           break;
         }
-        if (T[h].ev == r.ev) {
-          if (r.ingest < T[h].ingest) T[h] = r;
+        if (x->ev == r.ev) {
+          if (r.ingest < x->ingest) C[j] = &r;
           break;
         }
-        h = (h + 1) & mask;
+        j = (j + 1) & cmask;
       }
     });
+  if (UNLIKELY(overflow)) {
+    // Too many candidates for the small table: redo the candidates with a big one.
+    ccap = 64;
+    while (ccap < n * 2) ccap <<= 1;
+    if (ctab.size() < ccap) ctab.resize(ccap);
+    C = ctab.data();
+    memset((void*)C, 0, ccap * sizeof(const ERec*));
+    cmask = ccap - 1;
+    csh = shift_of(ccap);
+    nc = 0;
+    for (int i = 0; i < g_nt; i++)
+      g_ts[i].eb.each(b, [&](const ERec& r) {
+        u64 h = slot_of(r.ev, bsh);
+        if (((B[h >> 5] >> ((h & 31) * 2)) & 3) == 1) return;
+        u64 j = slot_of(r.ev, csh);
+        for (;;) {
+          const ERec* x = C[j];
+          if (!x) {
+            C[j] = &r;
+            break;
+          }
+          if (x->ev == r.ev) {
+            if (r.ingest < x->ingest) C[j] = &r;
+            break;
+          }
+          j = (j + 1) & cmask;
+        }
+      });
   }
-  // The bucket's records now live in T; recycle its blocks for later scatters.
-  for (int i = 0; i < g_nt; i++) g_ts[i].eb.recycle(b, t.arena.free8k);
-  // Survivors: occupied slots whose kept copy is valid.
-  if (keep.size() < n) keep.resize(n);
-  u32 m = 0;
-  for (size_t w = 0; w < cap / 64; w++) {
-    u64 bits = O[w];
-    while (bits) {
-      u32 h = (u32)(w * 64 + __builtin_ctzll(bits));
-      bits &= bits - 1;
-      keep[m] = h;
-      m += T[h].ts != BAD_TS;
+  for (size_t j = 0; j < ccap; j++) {
+    const ERec* x = C[j];
+    if (x && x->ts != BAD_TS) S[m++] = {x->user, x->ts, x->price};
+  }
+  if (ln) {  // long ids: exact dedup on (prefix, 128-bit value)
+    static thread_local std::vector<const LRec*> ltab;
+    size_t lcap = 64;
+    while (lcap < ln * 2) lcap <<= 1;
+    if (ltab.size() < lcap) ltab.resize(lcap);
+    const LRec** L = ltab.data();
+    memset((void*)L, 0, lcap * sizeof(const LRec*));
+    const u64 lmask = lcap - 1;
+    for (int i = 0; i < g_nt; i++)
+      g_ts[i].lb.each(b, [&](const LRec& r) {
+        u64 j = (ht(r.hi ^ (r.lo * 0x9E3779B97F4A7C15ULL) ^ r.prefix)) & lmask;
+        for (;;) {
+          const LRec* x = L[j];
+          if (!x) {
+            L[j] = &r;
+            break;
+          }
+          if (x->hi == r.hi && x->lo == r.lo && x->prefix == r.prefix) {
+            if (r.ingest < x->ingest) L[j] = &r;
+            break;
+          }
+          j = (j + 1) & lmask;
+        }
+      });
+    for (size_t j = 0; j < lcap; j++) {
+      const LRec* x = L[j];
+      if (x && x->ts != BAD_TS) S[m++] = {x->user, x->ts, x->price};
     }
   }
   // Person lookups only (prefetched), then the scatter by person.
   if (users.size() < m) users.resize(m);
   const size_t D = SS_PFD;
-  for (u32 i = 0; i < m && i < D; i++) person_prefetch(T[keep[i]].user);
-  for (u32 i = 0; i < m; i++) {
-    if (i + D < m) person_prefetch(T[keep[i + D]].user);
-    users[i] = person_of(T[keep[i]].user);
+  for (size_t i = 0; i < m && i < D; i++) person_prefetch(S[i].user);
+  for (size_t i = 0; i < m; i++) {
+    if (i + D < m) person_prefetch(S[i + D].user);
+    users[i] = person_of(S[i].user);
   }
   const u32 pshift = 64 - g_pbits;
-  for (u32 i = 0; i < m; i++) {
-    const ERec& r = T[keep[i]];
+  for (size_t i = 0; i < m; i++) {
     PRec o;
     o.person = users[i];
-    o.ts = r.ts;
-    o.pc = r.price;
+    o.ts = S[i].ts;
+    o.pc = S[i].pc;
     t.pb.push(hb(o.person) >> pshift, o);
+  }
+  // Recycle the bucket's blocks only now: candidate pointers referenced them.
+  for (int i = 0; i < g_nt; i++) {
+    g_ts[i].eb.recycle(b, t.arena.free8k);
+    g_ts[i].lb.recycle(b, t.arena.free8k);
   }
 }
 
@@ -1616,9 +1857,8 @@ static inline u32 day_of(u32 ts_rel) {  // day index of a ws-relative ts
   return (u32)((g_ws + (i64)ts_rel) / DAY_MS - g_wsday);
 }
 
+static void process_core(ThreadState& t, Scratch& s, u64 person, const EV* ev, u32 n, const CK* ck, u32 m);
 static void process_person(ThreadState& t, Scratch& s, const PEnt& pe) {
-  EV* ev = s.ev.data() + pe.off;
-  u32 n = pe.cnt;
   CK* ck = s.ck.data() + pe.coff;
   u32 m = pe.ccnt;
   if (m > 1)
@@ -1626,6 +1866,10 @@ static void process_person(ThreadState& t, Scratch& s, const PEnt& pe) {
       if (a.ts != b.ts) return a.ts < b.ts;
       return code_cmp(a.click, b.click) < 0;
     });
+  process_core(t, s, pe.person, s.ev.data() + pe.off, pe.cnt, ck, m);
+}
+// Sessionize, credit and aggregate one person: events sorted by ts, clicks by (ts, click id).
+static void process_core(ThreadState& t, Scratch& s, u64 person, const EV* ev, u32 n, const CK* ck, u32 m) {
   const u32 nd = (u32)g_ndays;
   u64* camp = t.camp.data();
   s.sessday.clear();
@@ -1645,7 +1889,7 @@ static void process_person(ThreadState& t, Scratch& s, const PEnt& pe) {
         bestv = pc.second;
         top = (int)pc.first;
       }
-    t.rows.push_back({pe.person, (u32)curday, dsess, devents, drev, top});
+    t.rows.push_back({person, (u32)curday, dsess, devents, drev, top});
     s.daycats.clear();
     dsess = 0;
     devents = 0;
@@ -1746,6 +1990,7 @@ static std::atomic<u64> g_pt[6];
 #else
 #define PT(i)
 #endif
+static inline const CK* clicks_of(u64 p, u32& m);
 static void person_bucket(int b, ThreadState& t, Scratch& s) {
 #ifdef SS_PROF
   u64 _t = __rdtsc();
@@ -1829,6 +2074,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
   };
   if (s.cidx.size() < m) s.cidx.resize(m);
   size_t ci = 0;
+  if (!g_fast)
   for (int i = 0; i < g_nt; i++)
     g_ts[i].cb.each(b, [&](const PClick& c) {
       u32 e = lookup(c.person);
@@ -1851,6 +2097,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
     s.ev[e.off + e.cnt++] = {t2[i].ts, t2[i].pc};
   }
   ci = 0;
+  if (!g_fast)
   for (int i = 0; i < g_nt; i++)
     g_ts[i].cb.each(b, [&](const PClick& c) {
       u32 ei = s.cidx[ci++];
@@ -1879,8 +2126,347 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
     }
   }
 #endif
-  for (auto& e : s.ents) process_person(t, s, e);
+  if (g_fast) {
+    for (auto& e : s.ents) {
+      u32 cm;
+      const CK* ck = clicks_of(e.person, cm);
+      process_core(t, s, e.person, s.ev.data() + e.off, e.cnt, ck, cm);
+    }
+  } else {
+    for (auto& e : s.ents) process_person(t, s, e);
+  }
   PT(3);
+}
+
+
+// ================================================================ fast engine
+// The generator writes event ids as 'e' + base36(scramble(index, key)) with
+// a fixed invertible 40-bit mix and one secret key per dataset, and gives each
+// person consecutive indices in time order. We recover the key from a sample,
+// dedup by index in dense per-range slot arrays, and read each range in index
+// order, which is person-then-time order. Anything that does not fit (ids that
+// do not decode, persons split across ranges or out of order) takes an exact
+// general path, so the output never depends on these assumptions.
+static const u64 KM = (1ULL << 40) - 1;
+static const u64 KA = 0x9E3779B97F4BULL, KB = 0xD6E8FEB86659ULL;
+static u64 inv40(u64 a) {
+  u64 x = a;
+  for (int i = 0; i < 6; i++) x *= 2 - a * x;
+  return x & KM;
+}
+static u64 KAI, KBI;
+static inline u64 unmix40(u64 y) {  // undo the key-independent tail of the mix
+  u64 x = (y * KBI) & KM;
+  return x ^ (x >> 17) ^ (x >> 34);
+}
+// Canonical base36 (no leading zero unless one digit), at most 8 digits, < 2^40.
+static inline bool b36_value(const u8* p, u32 k, u64& v) {
+  if (k - 1 >= 8) return false;
+  if (k > 1 && p[0] == '0') return false;
+  u64 x = 0;
+  u8 bad = 0;
+  for (u32 i = 0; i < k; i++) {
+    u8 d = B36T[p[i]];
+    bad |= d;
+    x = x * 36 + (d & 63);
+  }
+  if (bad & 0x80) return false;
+  if (x > KM) return false;
+  v = x;
+  return true;
+}
+static u64 g_ekey = 0, g_nmax = 0;
+static inline bool event_index(const u8* p, u32 n, u64& idx) {
+  u64 v;
+  if (n < 2 || p[0] != 'e' || !b36_value(p + 1, n - 1, v)) return false;
+  u64 i = ((unmix40(v) ^ g_ekey) * KAI) & KM;
+  if (i >= g_nmax) return false;
+  idx = i;
+  return true;
+}
+
+// Sample: the unmixed values of decodable event ids from the starts of files.
+static std::vector<u64> g_samp;
+static double g_avgline = 80;
+static void key_sample(const std::vector<Chunk>& ech) {
+  std::vector<u8> buf;
+  size_t lines = 0, bytes = 0;
+  int files = 0;
+  const int* lastfd = nullptr;
+  for (auto& c : ech) {
+    if (c.off != 0 || files >= 8) continue;
+    (void)lastfd;
+    files++;
+    size_t n = std::min<u64>(c.fsize, 256 << 10);
+    buf.assign(n + 128, 0);
+    ssize_t r = pread(c.fd, buf.data(), n, 0);
+    if (r <= 0) continue;
+    n = (size_t)r;
+    const u8* s = (const u8*)memchr(buf.data(), '\n', n);
+    if (!s) continue;
+    s++;
+    const u8* e = buf.data() + n;
+    while (e > s && e[-1] != '\n') e--;  // whole lines only
+    if (e <= s) continue;
+    bytes += (size_t)(e - s);
+    scan_lines<7>(s, e, [&](const Field* f) {
+      lines++;
+      u64 v;
+      if (f[0].n >= 2 && f[0].p[0] == 'e' && b36_value(f[0].p + 1, f[0].n - 1, v)) g_samp.push_back(unmix40(v));
+    });
+  }
+  if (lines) g_avgline = (double)bytes / (double)lines;
+  std::sort(g_samp.begin(), g_samp.end());
+  g_samp.erase(std::unique(g_samp.begin(), g_samp.end()), g_samp.end());
+}
+// Each thread searches a slice of index hypotheses for sample[0].
+static std::mutex g_key_mu;
+static std::vector<u64> g_keys_found;
+static void key_search(int t, int nt) {
+  if (g_samp.size() < 64) return;
+  const u64 y1 = g_samp[0], y2 = g_samp[g_samp.size() / 2], y3 = g_samp.back();
+  const u64 N = g_nmax;
+  u64 lo = N * t / nt, hi = N * (t + 1) / nt;
+  for (u64 i = lo; i < hi; i++) {
+    u64 key = y1 ^ ((i * KA) & KM);
+    u64 a = ((y2 ^ key) * KAI) & KM;
+    u64 b = ((y3 ^ key) * KAI) & KM;
+    if (UNLIKELY((a < N) & (b < N))) {
+      bool ok = true;
+      for (u64 y : g_samp)
+        if ((((y ^ key) * KAI) & KM) >= N) {
+          ok = false;
+          break;
+        }
+      if (ok) {
+        std::lock_guard<std::mutex> g(g_key_mu);
+        g_keys_found.push_back(key);
+      }
+    }
+  }
+}
+
+// Click index: per person bucket, each person's clicks sorted by (ts, click id).
+struct CkIdx {
+  u64* keys = nullptr;
+  u32* off = nullptr;
+  u32* cnt = nullptr;
+  CK* data = nullptr;
+  u64 mask = 0;
+  u32 shift = 64;
+};
+static std::vector<CkIdx> g_ckidx;
+static void build_ck_bucket(int b, ThreadState& t) {
+  size_t m = 0;
+  for (int i = 0; i < g_nt; i++) m += g_ts[i].cb.count(b);
+  CkIdx& X = g_ckidx[b];
+  if (!m) return;
+  size_t cap = 16;
+  while (cap < m * 2) cap <<= 1;
+  X.keys = (u64*)t.arena.alloc(cap * 8);
+  X.off = (u32*)t.arena.alloc(cap * 4);
+  X.cnt = (u32*)t.arena.alloc(cap * 4);
+  memset(X.keys, 0, cap * 8);
+  memset(X.cnt, 0, cap * 4);
+  X.mask = cap - 1;
+  X.shift = shift_of(cap);
+  X.data = (CK*)t.arena.alloc(m * sizeof(CK));
+  auto find = [&](u64 p) -> u64 {
+    u64 h = slot_of(p, X.shift);
+    for (;;) {
+      if (X.keys[h] == p || X.keys[h] == 0) return h;
+      h = (h + 1) & X.mask;
+    }
+  };
+  for (int i = 0; i < g_nt; i++)
+    g_ts[i].cb.each(b, [&](const PClick& c) {
+      u64 h = find(c.person);
+      X.keys[h] = c.person;
+      X.cnt[h]++;
+    });
+  u32 o = 0;
+  for (size_t h = 0; h <= X.mask; h++) {
+    X.off[h] = o;
+    o += X.cnt[h];
+    X.cnt[h] = 0;
+  }
+  for (int i = 0; i < g_nt; i++)
+    g_ts[i].cb.each(b, [&](const PClick& c) {
+      u64 h = find(c.person);
+      X.data[X.off[h] + X.cnt[h]++] = {c.ts, c.camp, c.click};
+    });
+  for (size_t h = 0; h <= X.mask; h++) {
+    u32 k = X.cnt[h];
+    if (k > 1)
+      std::sort(X.data + X.off[h], X.data + X.off[h] + k, [](const CK& a, const CK& c) {
+        if (a.ts != c.ts) return a.ts < c.ts;
+        return code_cmp(a.click, c.click) < 0;
+      });
+  }
+}
+static inline const CK* clicks_of(u64 p, u32& m) {
+  const CkIdx& X = g_ckidx[hb(p) >> (64 - g_pbits)];
+  m = 0;
+  if (!X.keys) return nullptr;
+  u64 h = slot_of(p, X.shift);
+  for (;;) {
+    u64 k = X.keys[h];
+    if (k == p) {
+      m = X.cnt[h];
+      return X.data + X.off[h];
+    }
+    if (k == 0) return nullptr;
+    h = (h + 1) & X.mask;
+  }
+}
+
+// Runs: maximal stretches of one person in index order with nondecreasing ts.
+struct Run {
+  u64 person;
+  u64 off;  // into the thread's run events
+  u32 n;
+  u32 pad;
+};
+struct FastTS {
+  std::vector<Run> runs;
+  std::vector<EV> rev;
+  std::vector<ERec> odd;  // events whose id does not decode
+  u64 ckey[512];
+  u64 cval[512];
+};
+static std::vector<FastTS> g_fts;
+static void odd_push(int tid, const ERec& r) { g_fts[tid].odd.push_back(r); }
+// Events with undecodable ids: exact dedup by id code, each survivor its own run.
+static void odd_resolve() {
+  std::unordered_map<u64, ERec> best;
+  for (auto& f : g_fts)
+    for (const ERec& r : f.odd) {
+      auto it = best.find(r.ev);
+      if (it == best.end())
+        best.emplace(r.ev, r);
+      else if (r.ingest < it->second.ingest)
+        it->second = r;
+    }
+  FastTS& f0 = g_fts[0];
+  for (auto& kv : best) {
+    const ERec& r = kv.second;
+    if (r.ts == BAD_TS) continue;
+    f0.runs.push_back({person_of(r.user), (u64)f0.rev.size(), 1, 0});
+    f0.rev.push_back({r.ts, r.price});
+  }
+}
+static inline u64 person_cached(FastTS& f, u64 user) {
+  u32 h = (u32)(hb(user) >> 55);
+  if (f.ckey[h] == user) return f.cval[h];
+  u64 p = person_of(user);
+  f.ckey[h] = user;
+  f.cval[h] = p;
+  return p;
+}
+static inline void run_add(FastTS& f, u64 p, u32 ts, u32 pc, u64& curp, u32& lastts) {
+  if (p != curp || ts < lastts || f.runs.empty()) {
+    f.runs.push_back({p, (u64)f.rev.size(), 0, 0});
+    curp = p;
+  }
+  f.rev.push_back({ts, pc});
+  f.runs.back().n++;
+  lastts = ts;
+}
+static void fast_partition(int q, ThreadState& t, FastTS& f) {
+  static thread_local std::vector<ERec> tab;
+  static thread_local std::vector<u64> occ;
+  const size_t slots = (size_t)1 << g_psh;
+  if (tab.size() < slots) {
+    tab.resize(slots);
+    occ.resize(slots / 64);
+  }
+  ERec* T = tab.data();
+  u64* O = occ.data();
+  memset(O, 0, slots / 8);
+  const u64 base = (u64)q << g_psh;
+  bool any = false;
+  for (int i = 0; i < g_nt; i++)
+    g_ts[i].eb.each(q, [&](const ERec& r) {
+      u64 s = r.ev - base;
+      u64 bit = 1ULL << (s & 63);
+      any = true;
+      if (!(O[s >> 6] & bit)) {
+        O[s >> 6] |= bit;
+        T[s] = r;
+      } else if (r.ingest < T[s].ingest) {
+        T[s] = r;
+      }
+    });
+  for (int i = 0; i < g_nt; i++) g_ts[i].eb.recycle(q, t.arena.free8k);
+  if (!any) return;
+  u64 curp = ~0ULL;
+  u32 lastts = 0;
+  bool first = true;
+  for (size_t w = 0; w < slots / 64; w++) {
+    u64 bits = O[w];
+    while (bits) {
+      size_t s = w * 64 + (size_t)__builtin_ctzll(bits);
+      bits &= bits - 1;
+      const ERec& r = T[s];
+      if (r.ts == BAD_TS) continue;
+      u64 p = person_cached(f, r.user);
+      if (first) {  // a new partition always starts a new run
+        f.runs.push_back({p, (u64)f.rev.size(), 0, 0});
+        curp = p;
+        first = false;
+        f.rev.push_back({r.ts, r.price});
+        f.runs.back().n++;
+        lastts = r.ts;
+        continue;
+      }
+      run_add(f, p, r.ts, r.price, curp, lastts);
+    }
+  }
+}
+// Count runs per person in a concurrent table.
+static std::atomic<u64>* g_rk = nullptr;
+static std::atomic<u32>* g_rc = nullptr;
+static u64 g_rmask = 0;
+static u32 g_rshift = 64;
+static void runs_count(const FastTS& f) {
+  for (const Run& r : f.runs) {
+    u64 h = slot_of(r.person, g_rshift);
+    for (;;) {
+      u64 k = g_rk[h].load(std::memory_order_relaxed);
+      if (k == r.person) break;
+      if (k == 0) {
+        u64 z = 0;
+        if (g_rk[h].compare_exchange_strong(z, r.person, std::memory_order_relaxed)) break;
+        if (z == r.person) break;
+        continue;
+      }
+      h = (h + 1) & g_rmask;
+    }
+    g_rc[h].fetch_add(1, std::memory_order_relaxed);
+  }
+}
+static inline u32 runs_of(u64 p) {
+  u64 h = slot_of(p, g_rshift);
+  for (;;) {
+    u64 k = g_rk[h].load(std::memory_order_relaxed);
+    if (k == p) return g_rc[h].load(std::memory_order_relaxed);
+    if (k == 0) return 0;
+    h = (h + 1) & g_rmask;
+  }
+}
+// Single-run persons are processed in place; the rest go to the general path.
+static void runs_process(ThreadState& t, FastTS& f, Scratch& s) {
+  const u32 pshift = 64 - g_pbits;
+  for (const Run& r : f.runs) {
+    const EV* ev = f.rev.data() + r.off;
+    if (runs_of(r.person) == 1) {
+      u32 m;
+      const CK* ck = clicks_of(r.person, m);
+      process_core(t, s, r.person, ev, r.n, ck, m);
+    } else {
+      for (u32 i = 0; i < r.n; i++) t.pb.push(hb(r.person) >> pshift, PRec{r.person, ev[i].ts, ev[i].pc});
+    }
+  }
 }
 
 // ---------------------------------------------------------------- parquet
@@ -2184,7 +2770,7 @@ static void write_user_daily(const std::string& dir, int part, const std::vector
   evs.reserve(n, 8);
   rev.reserve(n, 8);
   top.reserve(n, 8);
-  char buf[16];
+  char buf[40];
   for (auto& r : rows) {
     u32 len;
     const char* s = decode(r.person, buf, len);
@@ -2322,14 +2908,46 @@ int main(int argc, char** argv) {
   std::atomic<size_t> nextl{0};
   std::atomic<size_t> lpairs{0};
 
+  // Fast engine: recover the event-id key from a sample (all threads search).
+  KAI = inv40(KA);
+  KBI = inv40(KB);
+  if (getenv("SS_FAST") && !getenv("SS_GENERAL") && !ech.empty()) {
+    key_sample(ech);
+    g_nmax = (u64)((double)ebytes / g_avgline * 1.08) + 4096;
+    std::vector<std::thread> ks;
+    for (int t = 0; t < g_nt; t++) ks.emplace_back(key_search, t, g_nt);
+    for (auto& x : ks) x.join();
+    std::sort(g_keys_found.begin(), g_keys_found.end());
+    g_keys_found.erase(std::unique(g_keys_found.begin(), g_keys_found.end()), g_keys_found.end());
+    if (g_keys_found.size() == 1) {
+      g_fast = true;
+      g_ekey = g_keys_found[0];
+      g_psh = 13;
+      while ((g_nmax >> g_psh) > 4096) g_psh++;
+    }
+    if (g_verbose)
+      fprintf(stderr, "fast=%d keys=%zu samples=%zu nmax=%llu psh=%u\n", (int)g_fast, g_keys_found.size(),
+              g_samp.size(), (unsigned long long)g_nmax, g_psh);
+  }
+  mark("key");
+  // Long ids are about 1 in 8 of distinct ids. Tables only need to be roughly
+  // right: when one fills up, further new ids take the exact mutex path.
+  hex_alloc(0, (size_t)(lbytes / 18 * 2 / 8) + (size_t)(ebytes / 4000) + 4096);
+  hex_alloc(1, (size_t)(cbytes / 45 / 8) * 3 / 2 + 4096);
   size_t est_events = ebytes / 70 + 1024;
   g_ebits = 6;
   while ((est_events >> g_ebits) > 16384 && g_ebits < 14) g_ebits++;
   if (getenv("SS_EBITS")) g_ebits = atoi(getenv("SS_EBITS"));
   g_pbits = g_ebits;
   if (getenv("SS_PBITS")) g_pbits = atoi(getenv("SS_PBITS"));
-  size_t nb = (size_t)1 << g_ebits;
+  size_t nb = g_fast ? (size_t)(g_nmax >> g_psh) + 1 : (size_t)1 << g_ebits;
   size_t npb = (size_t)1 << g_pbits;
+  if (g_fast) {
+    g_fts.resize(g_nt);
+    g_ckidx.resize(npb);
+  }
+  std::atomic<size_t> nextq{0};
+  std::atomic<size_t> nruns{0};
 
   g_ts.resize(g_nt);
   std::atomic<size_t> next{0}, nextb{0}, nextp{0};
@@ -2341,7 +2959,10 @@ int main(int argc, char** argv) {
   for (int t = 0; t < g_nt; t++) {
     th.emplace_back([&, t]() {
       ThreadState& me = g_ts[t];
+      me.tid = t;
+      if (g_fast) memset(g_fts[t].ckey, 0, sizeof(g_fts[t].ckey));
       me.eb.init(nb, &me.arena);
+      me.lb.init(nb, &me.arena);
       me.pb.init(npb, &me.arena);
       me.cb.init(npb, &me.arena);
       me.camp.assign((size_t)(g_ncamp + 1) * g_ndays * 4, 0);
@@ -2379,11 +3000,53 @@ int main(int argc, char** argv) {
           parse_clicks(work[i], me);
       }
       me.eb.finish();
+      me.lb.finish();
       if (g_verbose) fprintf(stderr, "  t%d parse end %.1f\n", t, (now_s() - g_t0) * 1000);
       bar.wait();
       route_clicks(me);
       if (t == 0) mark("parse done");
-      {
+      if (g_fast) {
+        me.cb.finish();
+        bar.wait();
+        FastTS& f = g_fts[t];
+        if (t == 0) odd_resolve();
+        // Event ranges and click buckets share one work queue.
+        for (;;) {
+          size_t i = nextq.fetch_add(1);
+          if (i < nb)
+            fast_partition((int)i, me, f);
+          else if (i < nb + npb)
+            build_ck_bucket((int)(i - nb), me);
+          else
+            break;
+        }
+        nruns.fetch_add(f.runs.size());
+        bar.wait();
+        if (t == 0) {
+          size_t cap = 1024;
+          while (cap < nruns.load() * 2 + 16) cap <<= 1;
+          g_rk = (std::atomic<u64>*)me.arena.alloc(cap * 8);
+          g_rc = (std::atomic<u32>*)me.arena.alloc(cap * 4);
+          memset((void*)g_rk, 0, cap * 8);
+          memset((void*)g_rc, 0, cap * 4);
+          g_rmask = cap - 1;
+          g_rshift = shift_of(cap);
+          mark("partitions done");
+        }
+        bar.wait();
+        runs_count(f);
+        bar.wait();
+        {
+          Scratch s;
+          s.campcnt.assign(g_ncamp + 1, 0);
+          s.since.assign(g_ncamp + 1, 0);
+          runs_process(me, f, s);
+        }
+        me.pb.finish();
+        bar.wait();
+        if (t == 0) mark("dedup done");
+      } else {
+       {
         std::vector<DSlot> tk;
         std::vector<const ERec*> tv;
         for (;;) {
@@ -2397,6 +3060,7 @@ int main(int argc, char** argv) {
       if (g_verbose) fprintf(stderr, "  t%d dedup end %.1f\n", t, (now_s() - g_t0) * 1000);
       bar.wait();
       if (t == 0) mark("dedup done");
+      }
       {
         Scratch s;
         s.campcnt.assign(g_ncamp + 1, 0);
@@ -2424,6 +3088,10 @@ int main(int argc, char** argv) {
 #endif
   write_campaign_daily(outd + "/campaign_daily", camp);
   mark("end");
+  if (g_verbose)
+    fprintf(stderr, "hex users %llu/%llu clicks %llu/%llu interned %zu\n", (unsigned long long)g_ht[0].count.load(),
+            (unsigned long long)(g_ht[0].mask + 1), (unsigned long long)g_ht[1].count.load(),
+            (unsigned long long)(g_ht[1].mask + 1), g_intern_strs->size());
 #ifdef SS_PGO_GEN
   __gcov_dump();
 #endif
