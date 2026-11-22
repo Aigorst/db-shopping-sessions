@@ -1132,6 +1132,7 @@ static void load_lookups(const std::string& dir) {
     }
   }
   g_ncamp = (u32)g_camp_ids.size();
+  g_inline_clicks = g_ncamp < CAMP_MASK;
 }
 
 static i64 manifest_value(const std::string& m, const char* key) {
@@ -1169,9 +1170,16 @@ struct LRec {  // event copy with a long (prefix + 32 hex) id, grouped by hash o
 struct CRec {  // valid click, grouped later by person
   u64 user;
   u64 click;
-  u32 ts;  // ms since g_cs
-  u32 camp;
+  u32 ts;    // ms since g_cs
+  u32 camp;  // campaign index | inline long click id extras (see CLMARK)
+  u64 clo;
 };
+// Long click ids (prefix + 32 hex) are carried inline instead of interned:
+// click = CLMARK | hi >> 4, clo = lo, and camp bits 20..23 hold hi & 15 and
+// bits 24..31 the prefix byte. Campaign indices then must fit in 20 bits.
+static const u64 CLMARK = 0xFULL << 60;
+static const u32 CAMP_MASK = 0xFFFFF;
+static bool g_inline_clicks = true;
 struct PRec {  // surviving event, grouped by person
   u64 person;
   u32 ts;
@@ -1182,7 +1190,7 @@ struct PClick {
   u64 click;
   u32 ts;
   u32 camp;
-  u64 pad;
+  u64 clo;
 };
 
 // Bump allocator over one big lazily-committed reservation, carved per thread.
@@ -1573,7 +1581,15 @@ static void parse_clicks(const Chunk& c0, ThreadState& t) {
     if (camp == 0xFFFFFFFFu) return;
     CRec r;
     r.user = code_of(f[1].p, f[1].n);
-    r.click = code_of(f[0].p, f[0].n, 1);
+    u64 chi, clo;
+    if (g_inline_clicks && f[0].n == 33 && hex32(f[0].p + 1, chi, clo)) {
+      r.click = CLMARK | (chi >> 4);
+      r.clo = clo;
+      camp |= (u32)(chi & 15) << 20 | (u32)f[0].p[0] << 24;
+    } else {
+      r.click = code_of(f[0].p, f[0].n, 1);
+      r.clo = 0;
+    }
     r.ts = (u32)(ts - cs);
     r.camp = camp;
     t.clicks.push_back(r);
@@ -1595,9 +1611,10 @@ static void route_clicks(ThreadState& t) {
     PClick o;
     o.person = c.user;
     o.click = c.click;
+    o.clo = c.clo;
     o.ts = c.ts;
     o.camp = c.camp;
-    o.pad = 0;
+
     t.cb.push(hb(o.person) >> pshift, o);
   }
 }
@@ -1830,7 +1847,37 @@ struct CK {
   u32 ts;
   u32 camp;
   u64 click;
+  u64 clo;
 };
+// Byte-wise order of two click ids (ties on equal ts only).
+static inline const char* ck_text(const CK& c, char* buf, u32& len) {
+  if ((c.click & CLMARK) == CLMARK) {
+    u64 hi = ((c.click & ~CLMARK) << 4) | ((c.camp >> 20) & 15);
+    u8 bytes[16];
+    memcpy(bytes, &hi, 8);
+    memcpy(bytes + 8, &c.clo, 8);
+    buf[0] = (char)(c.camp >> 24);
+    for (int i = 0; i < 16; i++) {
+      buf[1 + 2 * i] = "0123456789abcdef"[bytes[i] >> 4];
+      buf[2 + 2 * i] = "0123456789abcdef"[bytes[i] & 15];
+    }
+    len = 33;
+    return buf;
+  }
+  return decode(c.click, buf, len);
+}
+static inline bool ck_less(const CK& a, const CK& b) {
+  if (a.ts != b.ts) return a.ts < b.ts;
+  if (!((a.click | b.click) & CLMARK) || ((a.click & CLMARK) != CLMARK && (b.click & CLMARK) != CLMARK))
+    return code_cmp(a.click, b.click) < 0;
+  char ba[40], bb[40];
+  u32 la, lb;
+  const char* sa = ck_text(a, ba, la);
+  const char* sb = ck_text(b, bb, lb);
+  int r = memcmp(sa, sb, la < lb ? la : lb);
+  if (r) return r < 0;
+  return la < lb;
+}
 struct PEnt {
   u64 person;
   u32 cnt, off, ccnt, coff;
@@ -1862,10 +1909,7 @@ static void process_person(ThreadState& t, Scratch& s, const PEnt& pe) {
   CK* ck = s.ck.data() + pe.coff;
   u32 m = pe.ccnt;
   if (m > 1)
-    std::sort(ck, ck + m, [](const CK& a, const CK& b) {
-      if (a.ts != b.ts) return a.ts < b.ts;
-      return code_cmp(a.click, b.click) < 0;
-    });
+    std::sort(ck, ck + m, ck_less);
   process_core(t, s, pe.person, s.ev.data() + pe.off, pe.cnt, ck, m);
 }
 // Sessionize, credit and aggregate one person: events sorted by ts, clicks by (ts, click id).
@@ -1930,7 +1974,7 @@ static void process_core(ThreadState& t, Scratch& s, u64 person, const EV* ev, u
     // clicks: window [S - 7d, S] in click base is [S, S + WEEK]
     u64 Sc = (u64)S + WEEK_MS;
     while (hi < m && ck[hi].ts <= Sc) {
-      u32 c = ck[hi].camp;
+      u32 c = ck[hi].camp & CAMP_MASK;
       if (s.campcnt[c]++ == 0) {
         s.since[c] = sidx;
         s.touched.push_back(c);
@@ -1938,7 +1982,7 @@ static void process_core(ThreadState& t, Scratch& s, u64 person, const EV* ev, u
       hi++;
     }
     while (lo < hi && ck[lo].ts < S) {
-      u32 c = ck[lo].camp;
+      u32 c = ck[lo].camp & CAMP_MASK;
       if (--s.campcnt[c] == 0) s.spans.push_back({c, s.since[c], sidx});
       lo++;
     }
@@ -1946,7 +1990,7 @@ static void process_core(ThreadState& t, Scratch& s, u64 person, const EV* ev, u
     if (lo < hi) {
       u32 k = hi - 1;
       while (k > lo && ck[k - 1].ts == ck[k].ts) k--;
-      credit = ck[k].camp;
+      credit = ck[k].camp & CAMP_MASK;
     }
     u64* cc = camp + ((size_t)credit * nd + day) * 4;
     cc[0]++;
@@ -2103,7 +2147,7 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
       u32 ei = s.cidx[ci++];
       if (!ei) return;
       PEnt& e = s.ents[ei - 1];
-      s.ck[e.coff + e.ccnt++] = {c.ts, c.camp, c.click};
+      s.ck[e.coff + e.ccnt++] = {c.ts, c.camp, c.click, c.clo};
     });
   PT(2);
 #ifdef SS_NORADIX
@@ -2293,15 +2337,12 @@ static void build_ck_bucket(int b, ThreadState& t) {
   for (int i = 0; i < g_nt; i++)
     g_ts[i].cb.each(b, [&](const PClick& c) {
       u64 h = find(c.person);
-      X.data[X.off[h] + X.cnt[h]++] = {c.ts, c.camp, c.click};
+      X.data[X.off[h] + X.cnt[h]++] = {c.ts, c.camp, c.click, c.clo};
     });
   for (size_t h = 0; h <= X.mask; h++) {
     u32 k = X.cnt[h];
     if (k > 1)
-      std::sort(X.data + X.off[h], X.data + X.off[h] + k, [](const CK& a, const CK& c) {
-        if (a.ts != c.ts) return a.ts < c.ts;
-        return code_cmp(a.click, c.click) < 0;
-      });
+      std::sort(X.data + X.off[h], X.data + X.off[h] + k, ck_less);
   }
 }
 static inline const CK* clicks_of(u64 p, u32& m) {
