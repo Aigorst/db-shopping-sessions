@@ -1,0 +1,5 @@
+/out/
+/dev/
+*.o
+.DS_Store
+ss
