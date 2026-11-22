@@ -991,6 +991,16 @@ static const size_t SLAB = (size_t)32 << 20;
 struct Arena {
   u8* cur = nullptr;
   u8* lim = nullptr;
+  void* alloc_aligned(size_t n, size_t align) {
+    uintptr_t c = ((uintptr_t)cur + align - 1) & ~(uintptr_t)(align - 1);
+    if (!cur || c + n > (uintptr_t)lim) {
+      alloc(SLAB);  // start a fresh slab (slabs are SLAB-aligned)
+      cur = lim - SLAB;
+      c = (uintptr_t)cur;
+    }
+    cur = (u8*)(c + n);
+    return (void*)c;
+  }
   void* alloc(size_t n) {
     n = (n + 63) & ~(size_t)63;
     if ((size_t)(lim - cur) < n) {
@@ -1024,76 +1034,86 @@ static inline void stream64(void* dst, const void* src) { memcpy(dst, src, 64); 
 static inline void stream_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 #endif
 
-// Per-thread scatter into nb buckets; each bucket is a linked list of blocks.
-// Writes go through a one-cache-line buffer per bucket and leave as 64-byte
-// non-temporal stores (no read-for-ownership of the destination line).
-template <class T, int CAP>
+// Per-thread scatter into nb buckets; each bucket is a linked list of BS-byte,
+// BS-aligned blocks (64-byte header, then records). Writes go through a
+// one-cache-line staging buffer per bucket and leave as 64-byte non-temporal
+// stores. The per-bucket state is one word: the write pointer (64-aligned)
+// with the staging count in its low 6 bits, so all heads fit in L1.
+template <class T, size_t BS>
 struct Buckets {
   static_assert(64 % sizeof(T) == 0, "record must divide a cache line");
-  static const int K = 64 / sizeof(T);
-  static_assert(CAP % K == 0, "block must hold whole lines");
-  struct Blk {
-    Blk* next;
+  static const u32 K = 64 / sizeof(T);
+  static const size_t CAPB = (BS - 64) / sizeof(T);
+  struct Hdr {
+    u8* next;
     u32 n;
-    alignas(64) T d[CAP];
   };
-  struct alignas(64) Head {
-    T buf[K];
-    T* cur;
-    T* lim;
-    Blk* blk;
-    u32 nbuf;
-  };
-  Head* h = nullptr;
+  u64* meta = nullptr;
+  u8* bufs = nullptr;
+  u8** last = nullptr;
   size_t nb = 0;
   Arena* arena = nullptr;
   void init(size_t n, Arena* a) {
     arena = a;
     nb = n;
-    h = (Head*)a->alloc(sizeof(Head) * n);
-    memset((void*)h, 0, sizeof(Head) * n);
+    meta = (u64*)a->alloc(n * 8);
+    bufs = (u8*)a->alloc(n * 64);
+    last = (u8**)a->alloc(n * sizeof(u8*));
+    memset(meta, 0, n * 8);
+    memset(last, 0, n * sizeof(u8*));
+  }
+  inline u8* grow(u8* cur) {
+    u8* old = cur ? cur - BS : nullptr;
+    if (old) ((Hdr*)old)->n = (u32)CAPB;
+    u8* blk = (u8*)arena->alloc_aligned(BS, BS);
+    ((Hdr*)blk)->next = old;
+    ((Hdr*)blk)->n = 0;
+    return blk + 64;
   }
   inline void push(size_t b, const T& r) {
-    Head& x = h[b];
-    x.buf[x.nbuf] = r;
-    if (++x.nbuf == K) {
-      if (UNLIKELY(x.cur == x.lim)) grow(x);
-      stream64(x.cur, x.buf);
-      x.cur += K;
-      x.nbuf = 0;
+    u64 m = meta[b];
+    u32 k = (u32)(m & 63);
+    T* buf = (T*)(bufs + b * 64);
+    buf[k] = r;
+    if (k + 1 == K) {
+      u8* cur = (u8*)(m & ~(u64)63);
+      if (UNLIKELY(((uintptr_t)cur & (BS - 1)) == 0)) cur = grow(cur);
+      stream64(cur, buf);
+      meta[b] = (u64)(cur + 64);
+    } else {
+      meta[b] = m + 1;
     }
-  }
-  void grow(Head& x) {
-    if (x.blk) x.blk->n = CAP;
-    Blk* nbk = (Blk*)arena->alloc(sizeof(Blk));
-    nbk->next = x.blk;
-    nbk->n = 0;
-    x.blk = nbk;
-    x.cur = nbk->d;
-    x.lim = nbk->d + CAP;
   }
   void finish() {
     for (size_t b = 0; b < nb; b++) {
-      Head& x = h[b];
-      if (x.nbuf) {
-        if (x.cur == x.lim) grow(x);
-        for (u32 i = 0; i < x.nbuf; i++) x.cur[i] = x.buf[i];
-        x.cur += x.nbuf;
-        x.nbuf = 0;
+      u64 m = meta[b];
+      u32 k = (u32)(m & 63);
+      u8* cur = (u8*)(m & ~(u64)63);
+      if (k) {
+        if (((uintptr_t)cur & (BS - 1)) == 0) cur = grow(cur);
+        memcpy(cur, bufs + b * 64, k * sizeof(T));
+        cur += k * sizeof(T);
       }
-      if (x.blk) x.blk->n = (u32)(x.cur - x.blk->d);
+      if (!cur) continue;
+      u8* blk = (u8*)(((uintptr_t)cur - 1) & ~(uintptr_t)(BS - 1));
+      ((Hdr*)blk)->n = (u32)((cur - (blk + 64)) / sizeof(T));
+      last[b] = blk;
+      meta[b] = 0;
     }
     stream_fence();
   }
   size_t count(size_t b) const {
     size_t n = 0;
-    for (Blk* k = h[b].blk; k; k = k->next) n += k->n;
+    for (u8* k = last[b]; k; k = ((Hdr*)k)->next) n += ((Hdr*)k)->n;
     return n;
   }
   template <class F>
   inline void each(size_t b, F&& f) const {
-    for (Blk* k = h[b].blk; k; k = k->next)
-      for (u32 i = 0; i < k->n; i++) f(k->d[i]);
+    for (u8* k = last[b]; k; k = ((Hdr*)k)->next) {
+      const T* d = (const T*)(k + 64);
+      u32 n = ((Hdr*)k)->n;
+      for (u32 i = 0; i < n; i++) f(d[i]);
+    }
   }
 };
 
@@ -1102,10 +1122,10 @@ static int g_ebits, g_pbits;
 
 struct ThreadState {
   Arena arena;
-  Buckets<ERec, 256> eb;    // by hash(event_id)
+  Buckets<ERec, 8192> eb;   // by hash(event_id)
   std::vector<CRec> clicks;
-  Buckets<PRec, 512> pb;    // by hash(person)
-  Buckets<PClick, 256> cb;  // by hash(person)
+  Buckets<PRec, 8192> pb;   // by hash(person)
+  Buckets<PClick, 8192> cb;  // by hash(person)
   std::vector<u64> camp;  // [(ncamp+1)*ndays*4]: sessions, purchasing, revenue, assisted
   struct Row {
     u64 person;
@@ -1296,33 +1316,41 @@ static void parse_clicks(const Chunk& c0, ThreadState& t) {
   Chunk c = c0;
   if (!resolve_chunk(c0, c.s, c.e)) return;
   const i64 cs = g_cs, we = g_we;
-  const u32 pshift = 64 - g_pbits;
-  const u32 RING = 8;
-  PClick ring[RING];
-  u32 rn = 0;
-  auto emit = [&](PClick& o) {
-    o.person = person_of(o.person);
-    t.cb.push(mix64(o.person) >> pshift, o);
-  };
   scan_lines<4>(c.s, c.e, [&](const Field* f) {
     if (f[0].n == 0 || f[1].n == 0) return;
     i64 ts;
     if (!parse_ts(f[3].p, f[3].n, ts) || ts < cs || ts >= we) return;
     u32 camp = campaign_idx(f[2]);
     if (camp == 0xFFFFFFFFu) return;
-    PClick o;
-    o.person = code_of(f[1].p, f[1].n);  // the user; resolved to the person in emit
-    o.click = code_of(f[0].p, f[0].n);
-    o.ts = (u32)(ts - cs);
-    o.camp = camp;
-    o.pad = 0;
-    person_prefetch(o.person);
-    PClick& slot = ring[rn % RING];
-    if (rn >= RING) emit(slot);
-    slot = o;
-    rn++;
+    CRec r;
+    r.user = code_of(f[1].p, f[1].n);
+    r.click = code_of(f[0].p, f[0].n);
+    r.ts = (u32)(ts - cs);
+    r.camp = camp;
+    t.clicks.push_back(r);
   });
-  for (u32 i = rn > RING ? rn - RING : 0; i < rn; i++) emit(ring[i % RING]);
+}
+
+// After parsing: persons for this thread's clicks (lookups only, prefetched),
+// then the scatter by person.
+static void route_clicks(ThreadState& t) {
+  const u32 pshift = 64 - g_pbits;
+  const size_t D = SS_PFD, n = t.clicks.size();
+  for (size_t i = 0; i < n && i < D; i++) person_prefetch(t.clicks[i].user);
+  for (size_t i = 0; i < n; i++) {
+    if (i + D < n) person_prefetch(t.clicks[i + D].user);
+    t.clicks[i].user = person_of(t.clicks[i].user);
+  }
+  for (size_t i = 0; i < n; i++) {
+    const CRec& c = t.clicks[i];
+    PClick o;
+    o.person = c.user;
+    o.click = c.click;
+    o.ts = c.ts;
+    o.camp = c.camp;
+    o.pad = 0;
+    t.cb.push(mix64(o.person) >> pshift, o);
+  }
 }
 
 static void parse_links(const Chunk& c0, std::vector<std::pair<u64, u64>>& pairs) {
@@ -1416,34 +1444,26 @@ static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>& tab, std::ve
     const ERec* r = T[h].r;
     if (r->ts != BAD_TS) tv[m++] = r;
   }
+  // Pass 1: person lookups only (prefetched); pass 2: scatter. Keeping the
+  // streaming stores out of the lookup loop leaves fill buffers for the misses.
+  static thread_local std::vector<u64> pers;
+  if (pers.size() < m) pers.resize(m);
   const size_t D = SS_PFD;
   for (size_t i = 0; i < m && i < D; i++) person_prefetch(tv[i]->user);
   for (size_t i = 0; i < m; i++) {
     if (i + D < m) person_prefetch(tv[i + D]->user);
+    pers[i] = person_of(tv[i]->user);
+  }
+  for (size_t i = 0; i < m; i++) {
     const ERec* r = tv[i];
     PRec o;
-    o.person = person_of(r->user);
+    o.person = pers[i];
     o.ts = r->ts;
     o.pc = r->price;
     t.pb.push(mix64(o.person) >> pshift, o);
   }
 }
 
-static void route_clicks(ThreadState& t) {
-  const u32 pshift = 64 - g_pbits;
-  const size_t D = SS_PFD, n = t.clicks.size();
-  for (size_t i = 0; i < n && i < D; i++) person_prefetch(t.clicks[i].user);
-  for (size_t i = 0; i < n; i++) {
-    if (i + D < n) person_prefetch(t.clicks[i + D].user);
-    const CRec& c = t.clicks[i];
-    PClick o;
-    o.person = person_of(c.user);
-    o.click = c.click;
-    o.ts = c.ts;
-    o.camp = c.camp;
-    t.cb.push(mix64(o.person) >> pshift, o);
-  }
-}
 
 // ---------------------------------------------------------------- phase 4: sessions
 struct EV {
@@ -1590,12 +1610,37 @@ static void process_person(ThreadState& t, Scratch& s, const PEnt& pe) {
       s.campcnt[c] = 0;
     }
   }
+  if (s.spans.empty()) return;
+  // first[d] = index of the first session on day >= d (sessions are in day order).
+  u32 first[257];
+  {
+    u32 k = 0;
+    for (u32 d = 0; d <= nd; d++) {
+      while (k < sidx && s.sessday[k] < d) k++;
+      first[d] = k;
+    }
+  }
   for (auto& sp : s.spans) {
-    for (u32 k = sp.a; k < sp.b; k++) camp[((size_t)sp.camp * nd + s.sessday[k]) * 4 + 3]++;
+    if (sp.a >= sp.b) continue;
+    u64* base = camp + (size_t)sp.camp * nd * 4 + 3;
+    for (u32 d = s.sessday[sp.a], dl = s.sessday[sp.b - 1]; d <= dl; d++) {
+      u32 lo = std::max(sp.a, first[d]), hi = std::min(sp.b, first[d + 1]);
+      if (hi > lo) base[(size_t)d * 4] += hi - lo;
+    }
   }
 }
 
+#ifdef SS_PROF
+#include <x86intrin.h>
+static std::atomic<u64> g_pt[6];
+#define PT(i) { u64 _n = __rdtsc(); g_pt[i] += _n - _t; _t = _n; }
+#else
+#define PT(i)
+#endif
 static void person_bucket(int b, ThreadState& t, Scratch& s) {
+#ifdef SS_PROF
+  u64 _t = __rdtsc();
+#endif
   size_t n = 0, m = 0;
   for (int i = 0; i < g_nt; i++) {
     n += g_ts[i].pb.count(b);
@@ -1635,6 +1680,8 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
       }
       t1[k++] = {r.ts, r.pc, e - 1, 0};
     });
+  PT(0);
+#ifndef SS_NORADIX
   // LSD radix sort by ts (3 x 11 bits), stable.
   {
     u32 hist[3][2048];
@@ -1657,6 +1704,10 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
     for (size_t i = 0; i < n; i++) t1[hist[1][(t2[i].ts >> 11) & 2047]++] = t2[i];
     for (size_t i = 0; i < n; i++) t2[hist[2][t1[i].ts >> 22]++] = t1[i];
   }
+#else
+  t2 = t1;  // grouped by person below, then sorted per person
+#endif
+  PT(1);
   auto lookup = [&](u64 p) -> u32 {
     u64 h = mix64(p) & mask;
     for (;;) {
@@ -1697,7 +1748,29 @@ static void person_bucket(int b, ThreadState& t, Scratch& s) {
       PEnt& e = s.ents[ei - 1];
       s.ck[e.coff + e.ccnt++] = {c.ts, c.camp, c.click};
     });
+  PT(2);
+#ifdef SS_NORADIX
+  for (auto& e : s.ents) {
+    EV* ev = s.ev.data() + e.off;
+    u32 c = e.cnt;
+    if (c <= 1) continue;
+    if (c <= 32) {
+      for (u32 i = 1; i < c; i++) {
+        EV x = ev[i];
+        u32 j = i;
+        while (j > 0 && ev[j - 1].ts > x.ts) {
+          ev[j] = ev[j - 1];
+          j--;
+        }
+        ev[j] = x;
+      }
+    } else {
+      std::sort(ev, ev + c, [](const EV& a, const EV& b) { return a.ts < b.ts; });
+    }
+  }
+#endif
   for (auto& e : s.ents) process_person(t, s, e);
+  PT(3);
 }
 
 // ---------------------------------------------------------------- parquet
@@ -2125,9 +2198,10 @@ int main(int argc, char** argv) {
     if (cap > ((size_t)4 << 30)) cap -= (size_t)2 << 30;
     ARENA_RESERVE = want < cap ? want : cap;
     ARENA_RESERVE = (ARENA_RESERVE + SLAB - 1) / SLAB * SLAB;
-    g_arena_base = (u8*)mmap(nullptr, ARENA_RESERVE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                             -1, 0);
+    g_arena_base = (u8*)mmap(nullptr, ARENA_RESERVE + ((size_t)2 << 20), PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (g_arena_base == MAP_FAILED) die("arena");
+    g_arena_base = (u8*)(((uintptr_t)g_arena_base + ((size_t)2 << 20) - 1) & ~(uintptr_t)(((size_t)2 << 20) - 1));
 #ifdef MADV_HUGEPAGE
     madvise(g_arena_base, ARENA_RESERVE, MADV_HUGEPAGE);
 #endif
@@ -2158,6 +2232,7 @@ int main(int argc, char** argv) {
       me.pb.init(nb, &me.arena);
       me.cb.init(nb, &me.arena);
       me.camp.assign((size_t)(g_ncamp + 1) * g_ndays * 4, 0);
+      me.clicks.reserve(cbytes / 40 / g_nt * 5 / 4 + 1024);
       // Links first, all threads: parse, union-find, smallest ID per person.
       for (;;) {
         size_t i = nextl.fetch_add(1);
@@ -2192,6 +2267,7 @@ int main(int argc, char** argv) {
       }
       me.eb.finish();
       bar.wait();
+      route_clicks(me);
       if (t == 0) mark("parse done");
       {
         std::vector<DSlot> tk;
@@ -2227,6 +2303,9 @@ int main(int argc, char** argv) {
   for (auto& t : g_ts)
     for (size_t i = 0; i < camp.size(); i++) camp[i] += t.camp[i];
   mark("user_daily written");
+#ifdef SS_PROF
+  for (int i = 0; i < 4; i++) fprintf(stderr, "pt%d %.1f ms-cpu\n", i, g_pt[i] / 2.8e6);
+#endif
   write_campaign_daily(outd + "/campaign_daily", camp);
   mark("end");
 #ifdef SS_PGO_GEN
