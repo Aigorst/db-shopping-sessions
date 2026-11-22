@@ -31,6 +31,9 @@ static const i64 DAY_MS = 86400000LL;
 static const i64 GAP_MS = 1800000LL;
 static const i64 WEEK_MS = 604800000LL;
 static const u32 BAD_TS = 0xFFFFFFFFu;
+static const u64 CLMARK = 0xFULL << 60;  // inline long click ids (see CRec)
+static const u32 CAMP_MASK = 0xFFFFF;
+static bool g_inline_clicks = true;
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -1177,9 +1180,7 @@ struct CRec {  // valid click, grouped later by person
 // Long click ids (prefix + 32 hex) are carried inline instead of interned:
 // click = CLMARK | hi >> 4, clo = lo, and camp bits 20..23 hold hi & 15 and
 // bits 24..31 the prefix byte. Campaign indices then must fit in 20 bits.
-static const u64 CLMARK = 0xFULL << 60;
-static const u32 CAMP_MASK = 0xFFFFF;
-static bool g_inline_clicks = true;
+
 struct PRec {  // surviving event, grouped by person
   u64 person;
   u32 ts;
@@ -2973,7 +2974,11 @@ int main(int argc, char** argv) {
   mark("key");
   // Long ids are about 1 in 8 of distinct ids. Tables only need to be roughly
   // right: when one fills up, further new ids take the exact mutex path.
-  hex_alloc(0, (size_t)(lbytes / 18 * 2 / 8) + (size_t)(ebytes / 4000) + 4096);
+  {
+    size_t uwant = (size_t)(lbytes / 18 * 2 / 8) + (size_t)(ebytes / 4000) + 4096;
+    uwant = uwant * (size_t)(getenv("SS_UTAB") ? atoi(getenv("SS_UTAB")) : 2) / 4;
+    hex_alloc(0, uwant);
+  }
   hex_alloc(1, (size_t)(cbytes / 45 / 8) * 3 / 2 + 4096);
   size_t est_events = ebytes / 70 + 1024;
   g_ebits = 6;
