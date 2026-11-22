@@ -1722,9 +1722,14 @@ struct DSlot {  // unused; kept for the worker's scratch type
   const ERec* r;
 };
 // Dedup one event bucket. A 2-bit saturating counter per hash slot (L1/L2
-// resident) marks event ids seen once; those are unique and skip any table.
-// Ids whose counter reached 2 (true duplicates or hash collisions) are
-// resolved exactly in a small open-addressing table keyed by the full id.
+// resident, SS_DFS slots per record) marks event ids seen once; those are
+// unique and skip any table. Ids whose counter reached 2 (true duplicates or
+// hash collisions) are resolved exactly in an open-addressing table keyed by
+// the full id. The first pass also counts those candidate records exactly, so
+// the table is sized once and never overflows.
+#ifndef SS_DFS
+#define SS_DFS 16
+#endif
 struct Surv {
   u64 user;
   u32 ts;
@@ -1742,72 +1747,41 @@ static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>&, std::vector
   }
   if (!n && !ln) return;
   size_t slots = 256;
-  while (slots < n * 4) slots <<= 1;  // 2 bits each: n bytes
+  while (slots < n * SS_DFS) slots <<= 1;  // 2 bits each
   if (bm.size() < slots / 32) bm.resize(slots / 32);
   u64* B = bm.data();
   memset(B, 0, slots / 4);
   const u32 bsh = shift_of(slots);
+  size_t cand = 0;  // records whose counter ends at 2
   for (int i = 0; i < g_nt; i++)
     g_ts[i].eb.each(b, [&](const ERec& r) {
       u64 h = slot_of(r.ev, bsh);
       u64& w = B[h >> 5];
       u32 sh = (u32)(h & 31) * 2;
       u64 c = (w >> sh) & 3;
+      cand += (c != 0) + (c == 1);  // 1 -> 2 makes both records candidates
       w += (u64)(c < 2) << sh;
     });
   if (sv.size() < n + ln) sv.resize(n + ln);
   Surv* S = sv.data();
-  size_t m = 0, nc = 0;
-  // Candidate table sized lazily; most buckets have ~3% candidates.
-  size_t ccap = 64;
-  while (ccap < (n / 8) * 2 + 64) ccap <<= 1;
+  size_t m = 0;
+  // Distinct candidate ids <= cand: load factor <= 1/2, no overflow.
+  size_t ccap = 16;
+  while (ccap < cand * 2) ccap <<= 1;
   if (ctab.size() < ccap) ctab.resize(ccap);
   const ERec** C = ctab.data();
   memset((void*)C, 0, ccap * sizeof(const ERec*));
-  u64 cmask = ccap - 1;
-  u32 csh = shift_of(ccap);
-  bool overflow = false;
-  for (int i = 0; i < g_nt; i++)
-    g_ts[i].eb.each(b, [&](const ERec& r) {
-      u64 h = slot_of(r.ev, bsh);
-      u64 c = (B[h >> 5] >> ((h & 31) * 2)) & 3;
-      if (LIKELY(c == 1)) {
-        if (r.ts != BAD_TS) S[m++] = {r.user, r.ts, r.price};
-        return;
-      }
-      if (UNLIKELY(nc * 2 >= ccap)) {
-        overflow = true;
-        return;
-      }
-      u64 j = slot_of(r.ev, csh);
-      for (;;) {
-        const ERec* x = C[j];
-        if (!x) {
-          C[j] = &r;
-          nc++;
-          break;
-        }
-        if (x->ev == r.ev) {
-          if (r.ingest < x->ingest) C[j] = &r;
-          break;
-        }
-        j = (j + 1) & cmask;
-      }
-    });
-  if (UNLIKELY(overflow)) {
-    // Too many candidates for the small table: redo the candidates with a big one.
-    ccap = 64;
-    while (ccap < n * 2) ccap <<= 1;
-    if (ctab.size() < ccap) ctab.resize(ccap);
-    C = ctab.data();
-    memset((void*)C, 0, ccap * sizeof(const ERec*));
-    cmask = ccap - 1;
-    csh = shift_of(ccap);
-    nc = 0;
+  const u64 cmask = ccap - 1;
+  const u32 csh = shift_of(ccap);
+  if (cand)
     for (int i = 0; i < g_nt; i++)
       g_ts[i].eb.each(b, [&](const ERec& r) {
         u64 h = slot_of(r.ev, bsh);
-        if (((B[h >> 5] >> ((h & 31) * 2)) & 3) == 1) return;
+        u64 c = (B[h >> 5] >> ((h & 31) * 2)) & 3;
+        if (LIKELY(c == 1)) {
+          if (r.ts != BAD_TS) S[m++] = {r.user, r.ts, r.price};
+          return;
+        }
         u64 j = slot_of(r.ev, csh);
         for (;;) {
           const ERec* x = C[j];
@@ -1822,7 +1796,11 @@ static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>&, std::vector
           j = (j + 1) & cmask;
         }
       });
-  }
+  else
+    for (int i = 0; i < g_nt; i++)
+      g_ts[i].eb.each(b, [&](const ERec& r) {
+        if (r.ts != BAD_TS) S[m++] = {r.user, r.ts, r.price};
+      });
   for (size_t j = 0; j < ccap; j++) {
     const ERec* x = C[j];
     if (x && x->ts != BAD_TS) S[m++] = {x->user, x->ts, x->price};
