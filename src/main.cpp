@@ -582,7 +582,7 @@ static inline void masks64(const u8* p, u64& sep, u64& nl, u64& qt) {
 // Resolves NF fields of one line from comma offsets; strips whole-field quotes.
 // q = number of quote characters in the line. False if malformed.
 template <int NF>
-static inline bool fields_of(const u8* ls, const u32* ends, u32 q, Field* f) {
+__attribute__((always_inline)) static inline bool fields_of(const u8* ls, const u32* ends, u32 q, Field* f) {
   u32 st = 0;
   if (q == 0) {
     for (int i = 0; i < NF; i++) {
@@ -1568,7 +1568,7 @@ static void parse_events(const Chunk& c0, ThreadState& t) {
   g_sink += c.e - c.s;
   return;
 #endif
-  scan_lines<7>(c.s, c.e, [&](const Field* f) {
+  scan_lines<7>(c.s, c.e, [&](const Field* f) __attribute__((always_inline)) {
 #if SS_STAGE == 1 || SS_STAGE == 3
     g_sink += f[0].n + f[6].n;
     return;
@@ -1641,7 +1641,7 @@ static void parse_clicks(const Chunk& c0, ThreadState& t) {
   Chunk c = c0;
   if (!resolve_chunk(c0, c.s, c.e)) return;
   const i64 cs = g_cs, we = g_we;
-  scan_lines<4>(c.s, c.e, [&](const Field* f) {
+  scan_lines<4>(c.s, c.e, [&](const Field* f) __attribute__((always_inline)) {
     if (f[0].n == 0 || f[1].n == 0) return;
     i64 ts;
     if (!parse_ts(f[3].p, f[3].n, ts) || ts < cs || ts >= we) return;
