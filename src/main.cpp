@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <mutex>
+#include <sched.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -2847,7 +2848,94 @@ struct Barrier {
   }
 };
 
+// ---------------------------------------------------------------- CPU count and build dispatch
+// Reads a small /proc or /sys file into buf (NUL-terminated); false if missing or empty.
+static bool read_sys(const char* path, char* buf, size_t cap) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  ssize_t n = read(fd, buf, cap - 1);
+  close(fd);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  return true;
+}
+
+// ceil(quota / period) from a CPU bandwidth limit; 0 if unlimited or unparsable.
+static int quota_cpus(long long q, long long p) { return q > 0 && p > 0 ? (int)((q + p - 1) / p) : 0; }
+
+// Smallest CPU bandwidth limit on this process's cgroup chain (v2 cpu.max, else v1 cfs quota); 0 = none.
+static int cgroup_cpu_limit() {
+  char buf[4096];
+  int lim = 0;
+  if (read_sys("/proc/self/cgroup", buf, sizeof buf)) {
+    // v2 entry "0::/path"; walk from the own cgroup up to the mount root.
+    for (char* line = buf; line && *line;) {
+      char* nl = strchr(line, '\n');
+      if (nl) *nl = 0;
+      if (strncmp(line, "0::", 3) == 0) {
+        std::string dir = std::string("/sys/fs/cgroup") + (line + 3);
+        while (!dir.empty() && dir.back() == '/') dir.pop_back();
+        for (;;) {
+          char cm[128];
+          long long q, p;
+          if (read_sys((dir + "/cpu.max").c_str(), cm, sizeof cm) && sscanf(cm, "%lld %lld", &q, &p) == 2) {
+            int c = quota_cpus(q, p);  // "max 100000" fails the scan above: no limit at this level
+            if (c > 0 && (lim == 0 || c < lim)) lim = c;
+          }
+          if (dir.size() <= 14) break;  // reached /sys/fs/cgroup
+          dir.resize(dir.rfind('/'));
+        }
+        break;
+      }
+      line = nl ? nl + 1 : nullptr;
+    }
+  }
+  if (lim > 0) return lim;
+  static const char* v1[] = {"/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"};
+  for (const char* d : v1) {
+    char a[64], b[64];
+    if (read_sys((std::string(d) + "/cpu.cfs_quota_us").c_str(), a, sizeof a) &&
+        read_sys((std::string(d) + "/cpu.cfs_period_us").c_str(), b, sizeof b)) {
+      int c = quota_cpus(atoll(a), atoll(b));  // quota -1 = unlimited
+      if (c > 0) return c;
+    }
+  }
+  return 0;
+}
+
+// Worker count: NCPU if set (the scorer sets NCPU=8), else min(affinity CPUs, cgroup quota), else 8.
+// hardware_concurrency() is not used: it reports host CPUs inside a --cpus limited container.
+static int pick_threads() {
+  const char* ncpu = getenv("NCPU");
+  if (ncpu && atoi(ncpu) > 0) return atoi(ncpu);
+  int n = 0;
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof set, &set) == 0) n = CPU_COUNT(&set);
+  int cg = cgroup_cpu_limit();
+  if (cg > 0 && (n == 0 || cg < n)) n = cg;
+  return n > 0 ? n : 8;
+}
+
+#if defined(__x86_64__) && !defined(__AVX512F__)
+// The portable build (x86-64-v3) re-executes a sibling AVX-512 build "<self>-avx512" when the CPU
+// and OS support the whole Cascade Lake ISA. If that file is absent (it is only shipped once verified)
+// or execve fails for any reason, this build keeps running. SS_NO_DISPATCH=1 disables the switch.
+static void maybe_exec_avx512(char** argv) {
+  if (getenv("SS_NO_DISPATCH")) return;
+  __builtin_cpu_init();
+  if (!__builtin_cpu_supports("x86-64-v4") || !__builtin_cpu_supports("avx512vnni")) return;
+  char path[4096];
+  ssize_t n = readlink("/proc/self/exe", path, sizeof path - 8);
+  if (n <= 0) return;
+  memcpy(path + n, "-avx512", 8);
+  execve(path, argv, environ);
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(__x86_64__) && !defined(__AVX512F__)
+  maybe_exec_avx512(argv);
+#endif
   g_t0 = now_s();
   const char* dd = getenv("DATA_DIR");
   const char* od = getenv("OUTPUT_DIR");
@@ -2856,10 +2944,10 @@ int main(int argc, char** argv) {
     data = argv[argc - 2];
     outd = argv[argc - 1];
   }
-  const char* ncpu = getenv("NCPU");
-  g_nt = ncpu ? atoi(ncpu) : (int)std::thread::hardware_concurrency();
+  g_nt = pick_threads();
   if (g_nt < 1) g_nt = 1;
   if (g_nt > 64) g_nt = 64;
+  if (g_verbose) fprintf(stderr, "threads %d (NCPU=%s)\n", g_nt, getenv("NCPU") ? getenv("NCPU") : "unset");
   init_b36();
   init_years();
 

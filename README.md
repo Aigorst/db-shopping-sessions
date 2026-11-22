@@ -8,7 +8,9 @@ libraries: the CSV scanner, timestamp parser, hash tables, and Parquet writer ar
 1. **Setup.** Read `manifest.json`, `products.csv` and `campaigns.csv`, and mmap every CSV with a
    zero page after it so SIMD loads may overrun. Files are cut into 4 MB byte ranges; each worker
    aligns its range to lines itself.
-2. **Parse (8 threads, work queue).**
+2. **Parse (worker threads, work queue).** The worker count is `NCPU` if set (the scorer sets 8),
+   otherwise the smaller of the affinity CPU count and the cgroup CPU quota (v2 `cpu.max`,
+   v1 `cfs_quota_us`), otherwise 8.
    - Each 64-byte block yields bitmasks for `,`, `\n` and `"` (AVX2 / NEON).
    - Fields are cut from the comma offsets, and quote stripping is branch-free: a line is valid
      iff each quoted field is wrapped whole and the line's quote count is twice the number of
@@ -32,6 +34,18 @@ libraries: the CSV scanner, timestamp parser, hash tables, and Parquet writer ar
      as activity spans resolved per day at the end.
 6. **Output.** A hand-written Parquet writer: PLAIN, uncompressed, one data page per column,
    `DATE` as INT32 with its logical type. One `user_daily` file per thread.
+
+## Build
+
+The Dockerfile builds `/ss` with `-march=x86-64-v3 -mtune=generic` (AVX2), so the image runs on
+any Haswell-or-newer x86 CPU. A plain `-march=cascadelake` build is not portable: GCC emits EVEX
+instructions throughout and it dies with SIGILL on CPUs without AVX-512.
+
+An optional AVX-512 build is wired in but off: `--build-arg AVX512_FLAGS="-march=cascadelake
+-mtune=cascadelake -DSS_AVX512"` adds `/ss-avx512`, and `/ss` re-executes it at startup only when
+CPUID reports x86-64-v4 plus VNNI (`SS_NO_DISPATCH=1` turns this off). If the file is missing or
+`execve` fails, `/ss` carries on. Keep it off until the AVX-512 build has been checked on AVX-512
+hardware or under Intel SDE (`sde64 -clx -- ...`); it has not been run yet.
 
 ## Checking
 
