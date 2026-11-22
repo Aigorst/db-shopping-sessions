@@ -131,7 +131,7 @@ static i32 days_of_key(const u8* p) {
 #include <immintrin.h>
 // SSE version: validates all 19 bytes with two 16-byte compares and computes
 // seconds-of-day with pshufb + pmaddubsw + pmaddwd. The date goes through the cache.
-static inline bool parse_civil(const u8* p, i64& secs) {
+__attribute__((always_inline)) static inline bool parse_civil(const u8* p, i64& secs) {
   const __m128i x = _mm_loadu_si128((const __m128i*)(p + 3));  // Y-MM-DDTHH:MM:SS
   const __m128i y = _mm_loadu_si128((const __m128i*)p);        // YYYY-...
   const __m128i lo = _mm_set1_epi8('0' - 1), hi = _mm_set1_epi8('9' + 1);
@@ -168,7 +168,7 @@ static inline bool parse_civil(const u8* p, i64& secs) {
 }
 #else
 // Calendar part "YYYY-MM-DDTHH:MM:SS" (19 bytes) -> seconds. Reads 24 bytes.
-static inline bool parse_civil(const u8* p, i64& secs) {
+__attribute__((always_inline)) static inline bool parse_civil(const u8* p, i64& secs) {
   u64 a = load8(p), b = load8(p + 8), c = load8(p + 16);
   // a: Y Y Y Y - M M -   b: D D T H H : M M   c: : S S ...
   const u64 ma = 0x00FFFF00FFFFFFFFULL, mb = 0xFFFF00FFFF00FFFFULL, mc = 0x0000000000FFFF00ULL;
@@ -202,7 +202,7 @@ static inline bool parse_civil(const u8* p, i64& secs) {
 // ingest_ts is always valid F1 (rules), so its digits need no re-validation:
 // date through the cache, time of day by SWAR. Anything unexpected falls back.
 static inline bool parse_ts(const u8* p, u32 n, i64& out);
-static inline bool parse_ingest(const u8* p, u32 n, i64& out) {
+__attribute__((always_inline)) static inline bool parse_ingest(const u8* p, u32 n, i64& out) {
   if (UNLIKELY(n != 20 || p[10] != 'T' || p[19] != 'Z')) return parse_ts(p, n, out);
   u64 a = load8(p), b = load8(p + 8), c = load8(p + 16);
   const u64 ma = 0x00FFFF00FFFFFFFFULL;
@@ -1934,7 +1934,7 @@ static inline const char* ck_text(const CK& c, char* buf, u32& len) {
   }
   return decode(c.click, buf, len);
 }
-static inline bool ck_less(const CK& a, const CK& b) {
+__attribute__((always_inline)) static inline bool ck_less(const CK& a, const CK& b) {
   if (a.ts != b.ts) return a.ts < b.ts;
   if (!((a.click | b.click) & CLMARK) || ((a.click & CLMARK) != CLMARK && (b.click & CLMARK) != CLMARK))
     return code_cmp(a.click, b.click) < 0;
