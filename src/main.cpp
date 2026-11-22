@@ -196,6 +196,31 @@ static inline bool parse_civil(const u8* p, i64& secs) {
 
 // Parses F1 / F2 / F3 into epoch milliseconds. False for any bad form.
 // May read up to 24 bytes from p (the input is padded).
+// ingest_ts is always valid F1 (rules), so its digits need no re-validation:
+// date through the cache, time of day by SWAR. Anything unexpected falls back.
+static inline bool parse_ts(const u8* p, u32 n, i64& out);
+static inline bool parse_ingest(const u8* p, u32 n, i64& out) {
+  if (UNLIKELY(n != 20 || p[10] != 'T' || p[19] != 'Z')) return parse_ts(p, n, out);
+  u64 a = load8(p), b = load8(p + 8), c = load8(p + 16);
+  const u64 ma = 0x00FFFF00FFFFFFFFULL;
+  u64 key = (a & ma) | ((b & 0xFF) << 32) | ((b & 0xFF00) << 48);
+  u32 h = (u32)((key * 0x9E3779B97F4A7C15ULL) >> 58);
+  i32 days;
+  if (LIKELY(t_dc.key[h] == key)) {
+    days = t_dc.days[h];
+  } else {
+    days = days_of_key(p);
+    t_dc.key[h] = key;
+    t_dc.days[h] = days;
+  }
+  if (UNLIKELY(days == BAD_DAYS)) return parse_ts(p, n, out);
+  u32 hh = (u32)(((b >> 24) & 0xF) * 10 + ((b >> 32) & 0xF));
+  u32 mm = (u32)(((b >> 48) & 0xF) * 10 + ((b >> 56) & 0xF));
+  u32 ss = (u32)(((c >> 8) & 0xF) * 10 + ((c >> 16) & 0xF));
+  out = ((i64)days * 86400 + hh * 3600 + mm * 60 + ss) * 1000;
+  return true;
+}
+
 __attribute__((always_inline)) static inline bool parse_ts(const u8* p, u32 n, i64& out) {
   if (n == 20 && p[4] == '-') {
     i64 secs;
@@ -571,6 +596,7 @@ static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
   if (UNLIKELY(g_oldscan)) return scan_lines_old<NF>(s, e, cb);
   static thread_local std::vector<u32> IDX;
   static thread_local std::vector<u64> QM;
+  static thread_local std::vector<u32> NLI;
   Field f[NF];
   u32 ends[NF];
   const u8* a = s;  // window start, always a line start
@@ -581,9 +607,11 @@ static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
     size_t nblk = (wl + 63) / 64;
     if (IDX.size() < nblk * 64 + 16) IDX.resize(nblk * 64 + 16);
     if (QM.size() < nblk + 2) QM.resize(nblk + 2);
+    if (NLI.size() < nblk * 64 + 16) NLI.resize(nblk * 64 + 16);
     u32* idx = IDX.data();
     u64* qm = QM.data();
-    u32 n = 0;
+    u32* nli = NLI.data();
+    u32 n = 0, nn = 0;
     for (size_t bi = 0; bi < nblk; bi++) {
       u64 sep, nl, qt;
       masks64(a + bi * 64, sep, nl, qt);
@@ -592,8 +620,24 @@ static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
         u64 lim = (1ULL << rem) - 1;
         sep &= lim;
         qt &= lim;
+        nl &= lim;
       }
       qm[bi] = qt;
+      {
+        const u64 H = 1ULL << 63;
+        u32 nc = (u32)__builtin_popcountll(nl);
+        u32* q = nli + nn;
+        u32 base = (u32)(bi * 64);
+        q[0] = base + (u32)__builtin_ctzll(nl | H);
+        nl &= nl - 1;
+        q[1] = base + (u32)__builtin_ctzll(nl | H);
+        nl &= nl - 1;
+        for (u32 w = 2; w < nc; w++) {
+          q[w] = base + (u32)__builtin_ctzll(nl);
+          nl &= nl - 1;
+        }
+        nn += nc;
+      }
       u32 cnt = (u32)__builtin_popcountll(sep);
       u32 base = (u32)(bi * 64);
       u32* o = idx + n;
@@ -619,33 +663,21 @@ static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
       n += cnt;
     }
     qm[nblk] = 0;
-    u32 j = 0, r0 = 0;  // r0 = current line start (window offset)
+    u32 j = 0, r0 = 0, li = 0;  // r0 = current line start (window offset)
     bool progressed = false;
-    for (;;) {
-      if (LIKELY(j + NF <= n)) {
-        u32 bad = 0;
-        for (int k = 0; k < NF - 1; k++) bad |= (u32)(a[idx[j + k]] != ',');
-        u32 le = idx[j + NF - 1];
-        bad |= (u32)(a[le] != '\n');
-        if (LIKELY(!bad)) {
-          for (int k = 0; k < NF; k++) ends[k] = idx[j + k] - r0;
-          if (fields_q<NF>(a + r0, ends, qm, r0, le, f)) cb(f);
-          r0 = le + 1;
-          j += NF;
-          progressed = true;
-          continue;
-        }
+    // A line is well-shaped iff its NF-th separator is the next newline.
+    while (li < nn) {
+      u32 le = nli[li++];
+      progressed = true;
+      if (LIKELY(j + NF - 1 < n && idx[j + NF - 1] == le)) {
+        for (int k = 0; k < NF; k++) ends[k] = idx[j + k] - r0;
+        if (fields_q<NF>(a + r0, ends, qm, r0, le, f)) cb(f);
+        j += NF;
+      } else {  // wrong field count: dropped
+        while (idx[j] != le) j++;
+        j++;
       }
-      // Malformed or short line, or the end of the indexed separators.
-      u32 k = j;
-      while (k < n && a[idx[k]] != '\n') k++;
-      if (k < n) {  // a complete line with the wrong field count: dropped
-        r0 = idx[k] + 1;
-        j = k + 1;
-        progressed = true;
-        continue;
-      }
-      break;
+      r0 = le + 1;
     }
     if (last) {
       // What remains is a final line without '\n' (only commas indexed).
@@ -1037,6 +1069,7 @@ static const size_t SLAB = (size_t)32 << 20;
 struct Arena {
   u8* cur = nullptr;
   u8* lim = nullptr;
+  std::vector<u8*> free8k;  // recycled 8 KB scatter blocks
   void* alloc_aligned(size_t n, size_t align) {
     uintptr_t c = ((uintptr_t)cur + align - 1) & ~(uintptr_t)(align - 1);
     if (!cur || c + n > (uintptr_t)lim) {
@@ -1111,7 +1144,13 @@ struct Buckets {
   inline u8* grow(u8* cur) {
     u8* old = cur ? cur - BS : nullptr;
     if (old) ((Hdr*)old)->n = (u32)CAPB;
-    u8* blk = (u8*)arena->alloc_aligned(BS, BS);
+    u8* blk;
+    if (BS == 8192 && !arena->free8k.empty()) {
+      blk = arena->free8k.back();
+      arena->free8k.pop_back();
+    } else {
+      blk = (u8*)arena->alloc_aligned(BS, BS);
+    }
     ((Hdr*)blk)->next = old;
     ((Hdr*)blk)->n = 0;
     return blk + 64;
@@ -1152,6 +1191,15 @@ struct Buckets {
     size_t n = 0;
     for (u8* k = last[b]; k; k = ((Hdr*)k)->next) n += ((Hdr*)k)->n;
     return n;
+  }
+  // Hands bucket b's blocks to a free list (after the bucket is consumed).
+  void recycle(size_t b, std::vector<u8*>& fl) {
+    for (u8* k = last[b]; k;) {
+      u8* nx = ((Hdr*)k)->next;
+      fl.push_back(k);
+      k = nx;
+    }
+    last[b] = nullptr;
   }
   template <class F>
   inline void each(size_t b, F&& f) const {
@@ -1323,7 +1371,7 @@ static void parse_events(const Chunk& c0, ThreadState& t) {
     ERec r;
     r.ev = code_of(f[0].p, f[0].n);
     i64 ing;
-    if (UNLIKELY(!parse_ts(f[3].p, f[3].n, ing))) ing = INT64_MAX / 2;
+    if (UNLIKELY(!parse_ingest(f[3].p, f[3].n, ing))) ing = INT64_MAX / 2;
     i64 is = ing / 1000 - g_ingest_base_s;
     r.ingest = is < 0 ? 0 : (is > 0xFFFFFFFFLL ? 0xFFFFFFFFu : (u32)is);
     r.ts = BAD_TS;
@@ -1492,6 +1540,8 @@ static void dedup_bucket(int b, ThreadState& t, std::vector<DSlot>&, std::vector
       }
     });
   }
+  // The bucket's records now live in T; recycle its blocks for later scatters.
+  for (int i = 0; i < g_nt; i++) g_ts[i].eb.recycle(b, t.arena.free8k);
   // Survivors: occupied slots whose kept copy is valid.
   if (keep.size() < n) keep.resize(n);
   u32 m = 0;
@@ -2329,6 +2379,7 @@ int main(int argc, char** argv) {
           parse_clicks(work[i], me);
       }
       me.eb.finish();
+      if (g_verbose) fprintf(stderr, "  t%d parse end %.1f\n", t, (now_s() - g_t0) * 1000);
       bar.wait();
       route_clicks(me);
       if (t == 0) mark("parse done");
@@ -2343,6 +2394,7 @@ int main(int argc, char** argv) {
       }
       me.pb.finish();
       me.cb.finish();
+      if (g_verbose) fprintf(stderr, "  t%d dedup end %.1f\n", t, (now_s() - g_t0) * 1000);
       bar.wait();
       if (t == 0) mark("dedup done");
       {
@@ -2355,6 +2407,7 @@ int main(int argc, char** argv) {
           person_bucket((int)b, me, s);
         }
       }
+      if (g_verbose) fprintf(stderr, "  t%d sess end %.1f\n", t, (now_s() - g_t0) * 1000);
       bar.wait();
       if (t == 0) mark("sessions done");
       std::string ud = outd + "/user_daily";
