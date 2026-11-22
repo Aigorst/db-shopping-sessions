@@ -711,8 +711,7 @@ static inline bool fields_q(const u8* ls, const u32* ends, const u64* qm, u32 r0
 // into an index plus per-block quote masks; (2) a walk over lines that checks
 // the NF-th separator is the newline and counts quotes by popcount.
 template <int NF, class CB>
-static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
-  if (UNLIKELY(g_oldscan)) return scan_lines_old<NF>(s, e, cb);
+static inline void scan_lines_idx(const u8* s, const u8* e, CB&& cb) {
   static thread_local std::vector<u32> IDX;
   static thread_local std::vector<u64> QM;
   static thread_local std::vector<u32> NLI;
@@ -814,6 +813,74 @@ static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
       W *= 2;  // a line longer than the window
     }
   }
+}
+
+// k-th set bit (0-based) of m, k < popcount(m).
+static inline u32 nth_bit(u64 m, u32 k) {
+#if defined(__BMI2__)
+  return (u32)__builtin_ctzll(_pdep_u64(1ULL << k, m) | (1ULL << 63));  // 63 if absent (unused)
+#else
+  for (u32 i = 0; i < k; i++) m &= m - 1;
+  return (u32)__builtin_ctzll(m | (1ULL << 63));
+#endif
+}
+static int g_scanmode = getenv("SS_OLDSCAN") ? 2 : (getenv("SS_IDXSCAN") ? 1 : 0);
+
+// Line-at-a-time scanner: a 128-byte window at the line start gives the
+// newline (tzcnt), the commas before it (exactly NF-1 or the line is dropped),
+// each comma's position (pdep + tzcnt, no loops) and the quote count. Lines of
+// 128 bytes or more, and the last few lines of the range, take the exact index
+// scanner. Calls cb(fields) for every well-formed line in [s, e).
+template <int NF, class CB>
+static inline void scan_lines(const u8* s, const u8* e, CB&& cb) {
+  if (UNLIKELY(g_scanmode == 2)) return scan_lines_old<NF>(s, e, cb);
+  if (UNLIKELY(g_scanmode == 1)) return scan_lines_idx<NF>(s, e, cb);
+  const u8* p = s;
+  Field f[NF];
+  u32 ends[NF];
+  while (p + 192 <= e) {
+    u64 s0, n0, q0;
+    masks64(p, s0, n0, q0);
+    u64 C0, C1, Q0, Q1;
+    u32 L;
+    if (n0) {
+      L = (u32)__builtin_ctzll(n0);
+      u64 below = (1ULL << L) - 1;
+      C0 = s0 & below;
+      Q0 = q0 & below;
+      C1 = 0;
+      Q1 = 0;
+    } else {
+      u64 s1, n1, q1;
+      masks64(p + 64, s1, n1, q1);
+      if (UNLIKELY(!n1)) {  // 128 bytes or more: exact scanner for this one line
+        const u8* nl = (const u8*)memchr(p + 128, '\n', (size_t)(e - (p + 128)));
+        if (!nl) break;
+        scan_lines_idx<NF>(p, nl + 1, cb);
+        p = nl + 1;
+        continue;
+      }
+      L = 64 + (u32)__builtin_ctzll(n1);
+      u64 below = (1ULL << (L - 64)) - 1;
+      C0 = s0;
+      Q0 = q0;
+      C1 = s1 & below;
+      Q1 = q1 & below;
+    }
+    u32 pc0 = (u32)__builtin_popcountll(C0);
+    if (LIKELY(pc0 + (u32)__builtin_popcountll(C1) == NF - 1)) {
+      for (u32 k = 0; k < NF - 1; k++) {
+        u32 a = nth_bit(C0, k < pc0 ? k : 0);
+        u32 b = 64 + nth_bit(C1, k < pc0 ? 0 : k - pc0);
+        ends[k] = k < pc0 ? a : b;
+      }
+      ends[NF - 1] = L;
+      u32 q = (u32)__builtin_popcountll(Q0) + (u32)__builtin_popcountll(Q1);
+      if (fields_of<NF>(p, ends, q, f)) cb(f);
+    }
+    p += L + 1;
+  }
+  if (p < e) scan_lines_idx<NF>(p, e, cb);
 }
 
 static inline bool feq(const Field& f, const char* s) {
