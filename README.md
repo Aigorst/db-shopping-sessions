@@ -5,9 +5,13 @@ libraries: the CSV scanner, timestamp parser, hash tables, and Parquet writer ar
 
 ## Pipeline
 
-1. **Setup.** Read `manifest.json`, `products.csv` and `campaigns.csv`, and mmap every CSV with a
-   zero page after it so SIMD loads may overrun. Files are cut into 4 MB byte ranges; each worker
-   aligns its range to lines itself.
+1. **Setup and reading.** Read `manifest.json`, `products.csv` and `campaigns.csv`. CSVs are cut
+   into 512 KiB byte ranges that workers `pread` into reused, zero-padded buffers (`SS_MMAP=1`
+   maps them instead). A range owns the lines whose `\n` falls inside it; the worker reads its
+   range and then looks back one page for the start of its first line, so no worker reads ahead
+   into a later range (on a cold cache that splits the kernel's read requests). Optional
+   read-ahead helpers (`SS_RA=4`) issue `readahead(2)` in 2 MB pieces, in the order workers take
+   ranges and at most 256 MB ahead of them; they are off by default (see the comment in `main`).
 2. **Parse (worker threads, work queue).** The worker count is `NCPU` if set (the scorer sets 8),
    otherwise the smaller of the affinity CPU count and the cgroup CPU quota (v2 `cpu.max`,
    v1 `cfs_quota_us`), otherwise 8.

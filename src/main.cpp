@@ -926,82 +926,146 @@ static inline void prefault(const u8* s, const u8* e) {
 #endif
 }
 
-// Read mode: per-thread buffer holding file bytes [boff, boff + bn), zero-padded.
+// Read mode: per-thread buffer, zero-padded after the bytes read.
 struct ReadBuf {
   u8* p = nullptr;
-  size_t cap = 0, n = 0;
-  u64 boff = 0;
-  int fd = -1;
-  void reserve(size_t want) {
+  size_t cap = 0;
+  void reserve(size_t want) {  // contents are not kept
     if (want + 128 <= cap) return;
-    size_t nc = (want + 128) * 2;
-    u8* np = (u8*)aligned_alloc(64, (nc + 63) / 64 * 64);
-    if (p) {
-      memcpy(np, p, n);
-      free(p);
-    }
-    p = np;
-    cap = nc;
-  }
-  // Ensures bytes [boff, upto) are present (upto <= file size).
-  void ensure(u64 upto) {
-    if (boff + n >= upto) return;
-    reserve((size_t)(upto - boff));
-    while (boff + n < upto) {
-      ssize_t r = pread(fd, p + n, (size_t)(upto - boff - n), (off_t)(boff + n));
-      if (r <= 0) die("pread");
-      n += (size_t)r;
-    }
-    memset(p + n, 0, 128);
+    free(p);
+    cap = (want + 128) * 2;
+    p = (u8*)aligned_alloc(64, (cap + 63) / 64 * 64);
   }
 };
 static thread_local ReadBuf t_rb;
 
+static void pread_all(int fd, u8* p, size_t n, u64 off) {
+  while (n) {
+    ssize_t r = pread(fd, p, n, (off_t)off);
+    if (r <= 0) die("pread");
+    p += r;
+    n -= (size_t)r;
+    off += (u64)r;
+  }
+}
+
 // Line-aligns a read-mode chunk into t_rb; s/e point into the buffer.
+// A chunk [off, end) owns the lines whose '\n' lies in [off, end), plus an
+// unterminated last line when end is the end of the file; the file's first
+// line (the header) is skipped. The first owned line starts in an earlier
+// chunk, so the worker reads its own bytes and then looks back. It never
+// reads bytes of a later chunk: on a cold page cache that splits the kernel's
+// read requests at every chunk boundary (measured: 77 KB instead of 127 KB
+// average requests and about 18% slower reads).
 static inline bool read_chunk(const Chunk& c, const u8*& s, const u8*& e) {
   ReadBuf& rb = t_rb;
-  rb.fd = c.fd;
-  rb.boff = c.off == 0 ? 0 : c.off - 1;
-  rb.n = 0;
-  const u64 fsz = c.fsize;
-  u64 want = c.end + 4096 < fsz ? c.end + 4096 : fsz;
-  rb.ensure(want);
-  // First line start: after the first '\n' at or after boff.
-  u64 scanned = 0;
-  const u8* x;
-  for (;;) {
-    x = (const u8*)memchr(rb.p + scanned, '\n', rb.n - scanned);
-    if (x) break;
-    if (rb.boff + rb.n >= fsz) return false;
-    scanned = rb.n;
-    rb.ensure(std::min<u64>(fsz, rb.boff + rb.n * 2 + 4096));
-  }
-  u64 first = rb.boff + (u64)(x - rb.p) + 1;  // file offset of first line start
-  if (first >= c.end) return false;
-  u64 last_end;
-  if (c.end == fsz) {
-    rb.ensure(fsz);
-    last_end = fsz;
+  const u64 len = c.end - c.off;
+  const u64 back = c.off < 4096 ? c.off : 4096;
+  rb.reserve(back + len);
+  u8* body = rb.p + back;
+  pread_all(c.fd, body, len, c.off);
+  memset(body + len, 0, 128);
+  if (c.end == c.fsize) {
+    e = body + len;
   } else {
-    u64 from = c.end - 1;  // the line containing byte end-1 is the last one owned
-    for (;;) {
-      u64 have = rb.boff + rb.n;
-      const u8* y = (const u8*)memchr(rb.p + (from - rb.boff), '\n', (size_t)(have - from));
-      if (y) {
-        last_end = rb.boff + (u64)(y - rb.p) + 1;
+    const u8* y = (const u8*)memrchr(body, '\n', len);
+    if (!y) return false;  // no line ends here
+    e = y + 1;
+  }
+  u64 ls = 0;  // file offset of the line containing byte off; 0 = the header
+  if (c.off) {
+    pread_all(c.fd, rb.p, back, c.off - back);
+    const u8* x = (const u8*)memrchr(rb.p, '\n', back);
+    if (x) {
+      s = x + 1;
+      return s < e;
+    }
+    // Line longer than a page: find its start, then re-read it with the chunk.
+    u8 tmp[4096];
+    for (u64 pos = c.off - back; pos > 0;) {
+      u64 k = pos < sizeof tmp ? pos : sizeof tmp;
+      pread_all(c.fd, tmp, k, pos - k);
+      x = (const u8*)memrchr(tmp, '\n', k);
+      if (x) {
+        ls = pos - k + (u64)(x - tmp) + 1;
         break;
       }
-      if (have >= fsz) {
-        last_end = fsz;
-        break;
-      }
-      from = have;
-      rb.ensure(std::min<u64>(fsz, rb.boff + rb.n * 2 + 4096));
+      pos -= k;
     }
   }
-  s = rb.p + (first - rb.boff);
-  e = rb.p + (last_end - rb.boff);
+  if (ls == 0) {  // the header: start after its '\n' (at or after off)
+    const u8* x = (const u8*)memchr(body, '\n', len);
+    if (!x) return false;
+    s = x + 1;
+    return s < e;
+  }
+  size_t eo = (size_t)(e - body);
+  u64 n = c.end - ls;
+  rb.reserve(n);
+  pread_all(c.fd, rb.p, n, ls);
+  memset(rb.p + n, 0, 128);
+  s = rb.p;
+  e = rb.p + (c.off - ls) + eo;
   return true;
+}
+
+// Cold-cache read-ahead (read mode). Workers pread one chunk at a time, which
+// keeps little I/O in flight and lets the kernel split it into small requests
+// when the input is not in the page cache. Helper threads walk the input in
+// the order the workers take chunks and issue readahead(2) over pieces of
+// consecutive chunks of one file (up to g_ra_step bytes), staying at most
+// g_ra_ahead chunks ahead of the workers' cursor (bounded page-cache use).
+// Helpers only start I/O; no data flows through them, so results never
+// depend on them.
+struct RaItem {
+  int fd;
+  u64 off, len;
+  size_t chunk;  // consumption index of the first chunk in the piece
+};
+static std::vector<RaItem> g_ra;          // pieces in consumption order
+static std::atomic<size_t> g_ra_next{0};  // next piece a helper will issue
+static std::atomic<size_t>* g_ra_cur[2];  // worker cursors (links, then events+clicks)
+static size_t g_ra_nl;                    // number of link chunks
+static size_t g_ra_ahead = 512;
+static u64 g_ra_step = (u64)2 << 20;
+static std::atomic<bool> g_ra_stop{false};
+static unsigned g_ra_sleep = 1000;  // us between cursor checks
+
+static inline size_t ra_consumed() {
+  size_t l = g_ra_cur[0]->load(std::memory_order_relaxed);
+  if (l < g_ra_nl) return l;
+  return g_ra_nl + g_ra_cur[1]->load(std::memory_order_relaxed);
+}
+
+static void ra_add(const Chunk& c, size_t idx) {
+  if (!g_ra.empty()) {
+    RaItem& b = g_ra.back();
+    if (b.fd == c.fd && b.off + b.len == c.off && b.len + (c.end - c.off) <= g_ra_step) {
+      b.len += c.end - c.off;
+      return;
+    }
+  }
+  g_ra.push_back({c.fd, c.off, c.end - c.off, idx});
+}
+
+static void ra_helper() {
+  const size_t n = g_ra.size();
+  for (;;) {
+    size_t i = g_ra_next.fetch_add(1, std::memory_order_relaxed);
+    if (i >= n) return;
+    const RaItem& r = g_ra[i];
+    for (;;) {
+      if (g_ra_stop.load(std::memory_order_relaxed)) return;
+      size_t c = ra_consumed();
+      if (r.chunk <= c + g_ra_ahead) break;
+      usleep(g_ra_sleep);
+    }
+#if defined(__linux__)
+    readahead(r.fd, (off64_t)r.off, (size_t)r.len);
+#else
+    posix_fadvise(r.fd, (off_t)r.off, (off_t)r.len, POSIX_FADV_WILLNEED);
+#endif
+  }
 }
 
 static inline bool resolve_chunk(const Chunk& c, const u8*& s, const u8*& e) {
@@ -3041,6 +3105,27 @@ int main(int argc, char** argv) {
   std::atomic<size_t> next{0}, nextb{0}, nextp{0};
   Barrier bar;
   bar.n = g_nt;
+  {
+    // Read-ahead helpers (see ra_helper), opt-in: SS_RA=<helpers>, SS_RA_AHEAD=<chunks
+    // of lookahead>, SS_RA_STEP=<bytes per readahead call>. Cold f60m (8 CPUs):
+    // 0 / 4 / 8 helpers gave 5.41 / 5.07 / 4.94 s, warm unchanged natively. Off by
+    // default: in docker runs (p20m, warm) about 1 run in 14 with helpers had two
+    // workers stall 1.2-2 s in dedup, never seen without them (cause not found).
+    int nra = getenv("SS_RA") ? atoi(getenv("SS_RA")) : 0;
+    if (getenv("SS_RA_AHEAD")) g_ra_ahead = (size_t)atol(getenv("SS_RA_AHEAD"));
+    if (getenv("SS_RA_STEP")) g_ra_step = (u64)atol(getenv("SS_RA_STEP"));
+    if (getenv("SS_RA_SLEEP")) g_ra_sleep = (unsigned)atoi(getenv("SS_RA_SLEEP"));
+    if (!g_use_mmap && nra > 0) {
+      g_ra.reserve(lch.size() + work.size());
+      size_t idx = 0;
+      for (auto* v : {&lch, &work})
+        for (const Chunk& c : *v) ra_add(c, idx++);
+      g_ra_cur[0] = &nextl;
+      g_ra_cur[1] = &next;
+      g_ra_nl = lch.size();
+      for (int i = 0; i < nra; i++) std::thread(ra_helper).detach();
+    }
+  }
   mkdir((outd + "/user_daily").c_str(), 0777);
   mkdir((outd + "/campaign_daily").c_str(), 0777);
   std::vector<std::thread> th;
@@ -3087,6 +3172,7 @@ int main(int argc, char** argv) {
         else
           parse_clicks(work[i], me);
       }
+      g_ra_stop.store(true, std::memory_order_relaxed);
       me.eb.finish();
       me.lb.finish();
       if (g_verbose) fprintf(stderr, "  t%d parse end %.1f\n", t, (now_s() - g_t0) * 1000);
